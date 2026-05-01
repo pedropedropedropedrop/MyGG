@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets and credentials — NEVER commit these.
+.env
+*.db
+token*.json
+.whoop_token.json
+credentials.json
+
+# Local runtime data
+logs/
+*.log
+inbox/
+meeting_transcripts/
+voice_reference.wav
+.current_location
+.evolution_result
+qdrant_storage/
+
+# Personality file is intentionally per-user — don't commit.
+personality.md
+
+# WhatsApp bridge runtime artifacts
+whatsapp-bridge/node_modules/
+whatsapp-bridge/auth_info_baileys/
+whatsapp-bridge/auth_state/
+whatsapp-bridge/qr.png
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

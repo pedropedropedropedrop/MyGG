@@ -1,0 +1,29 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  compile:
+    name: Python compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile-check every Python file
+        run: |
+          python -m compileall -q .
+
+      - name: Verify module auto-discovery
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-dotenv
+          python -c "import sys; sys.path.insert(0, '.'); from pathlib import Path; [__import__('py_compile').compile(str(p), doraise=True) for p in Path('.').rglob('*.py') if 'venv' not in str(p) and '.github' not in str(p)]"

@@ -1,0 +1,16 @@
+{
+  "name": "gg-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp bridge for GG Personal Assistant",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "baileys": "^7.0.0-rc.9",
+    "dotenv": "^16.0.0",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
