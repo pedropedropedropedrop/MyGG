@@ -1,0 +1,3 @@
+# Optional voice notes, meeting transcription and spoken replies.
+faster-whisper>=1.2,<2
+edge-tts>=7,<8

@@ -1,28 +1,23 @@
 """Periodic WhatsApp message summarizer — extracts actionable context into mem0."""
 
-import os
 import logging
 import asyncio
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from collections import defaultdict
 
-import anthropic
 from anthropic import APIStatusError
 
+import llm
 import tools
 
 logger = logging.getLogger(__name__)
 
-TZ = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 MAX_MESSAGES_PER_CHAT = 50
-
-client = anthropic.AsyncAnthropic()
 
 
 async def summarize_whatsapp(context=None):
     """Periodic job: summarize unsummarized WhatsApp messages into mem0."""
+    if not tools.memory_enabled():
+        return
     logger.info("Running WhatsApp summarization")
 
     try:
@@ -51,13 +46,13 @@ async def summarize_whatsapp(context=None):
         # Group by chat
         chats: dict[str, list] = defaultdict(list)
         for msg in messages:
-            chat_key = msg["chat_name"] or msg["chat_jid"]
-            chats[chat_key].append(msg)
+            chats[msg["chat_jid"]].append(msg)
 
         summarized_ids = []
 
-        for chat_name, chat_msgs in chats.items():
-            is_group = chat_msgs[0]["chat_jid"].endswith("@g.us") if chat_msgs else False
+        for chat_jid, chat_msgs in chats.items():
+            chat_name = chat_msgs[0]["chat_name"] or chat_jid
+            is_group = chat_jid.endswith("@g.us")
 
             # Skip group chats with fewer than 2 messages (noise filter)
             # But always process 1:1 DMs — a single message can be high-signal
@@ -80,8 +75,7 @@ async def summarize_whatsapp(context=None):
                 response = None
                 for attempt in range(3):
                     try:
-                        response = await client.messages.create(
-                            model=MODEL,
+                        response = await llm.create(
                             max_tokens=500,
                             messages=[
                                 {
@@ -103,25 +97,28 @@ async def summarize_whatsapp(context=None):
                             continue
                         raise
                 if response is None:
-                    logger.warning(f"All retries exhausted for chat '{chat_name}'")
+                    logger.warning("WhatsApp summary retries exhausted")
                     continue
 
-                summary_text = response.content[0].text
+                summary_text = llm.text(response)
+                if not summary_text:
+                    continue
 
                 # Store in mem0 (skip if nothing actionable)
-                if "no actionable" not in summary_text.lower():
-                    now = datetime.now(TZ)
-                    tagged_summary = f"[WhatsApp {chat_name} {now.strftime('%Y-%m-%d')}] {summary_text}"
+                if summary_text.casefold().strip(" .!") != "no actionable items":
+                    date = batch[-1]["timestamp"][:10]
+                    tagged_summary = f"[WhatsApp {chat_name} ({chat_jid}), {date}] {summary_text}"
                     await tools.remember(
                         tagged_summary,
-                        tags=["whatsapp", chat_name, now.strftime("%Y-%m-%d")],
+                        tags=["whatsapp", chat_name, chat_jid, date],
+                        infer=False,  # The summary is already extracted. Save it verbatim.
                     )
-                    logger.info(f"Summarized {len(batch)} messages from '{chat_name}'")
+                    logger.info("Summarized %d WhatsApp messages", len(batch))
                 else:
-                    logger.info(f"No actionable items in '{chat_name}' ({len(batch)} messages)")
+                    logger.info("No actionable items in %d WhatsApp messages", len(batch))
 
             except Exception:
-                logger.exception(f"Failed to summarize chat '{chat_name}'")
+                logger.exception("Failed to summarize a WhatsApp chat")
                 continue  # don't mark as summarized if summary failed
 
             # Mark batch as summarized

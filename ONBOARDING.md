@@ -1,573 +1,184 @@
-# MyGG Onboarding
+# Set up your own GG
 
-This is the full installation walkthrough. It assumes you can copy-paste
-commands into a terminal but does not assume you are a software engineer.
-You should be able to get from "fresh PC" to "talking to your assistant on
-Telegram" in 30–60 minutes.
+You need a computer that can stay on, a Telegram account, and either a paid Anthropic API key or a local Ollama model. Start with a private text conversation. You can add each integration independently after that.
 
-If anything goes wrong, scroll down to **[Troubleshooting](#troubleshooting)**
-or paste the entire repository into Claude Code and ask it to debug — that
-is genuinely the easiest path when something breaks.
+**[Install](#install-mygg) · [Choose a model](#choose-a-chat-model) · [Verify your first chat](#first-conversation) · [Optional features](#optional-features) · [Upgrade](#update-an-existing-installation) · [Troubleshooting](#troubleshooting)**
 
----
+## Install MyGG
 
-## Table of Contents
+### 1. Download the project
 
-1. [What you'll end up with](#1-what-youll-end-up-with)
-2. [Prerequisites](#2-prerequisites)
-3. [Step 1 — Clone the repo and install dependencies](#step-1--clone-the-repo-and-install-dependencies)
-4. [Step 2 — Telegram bot](#step-2--telegram-bot)
-5. [Step 3 — Anthropic API key](#step-3--anthropic-api-key)
-6. [Step 4 — Vector database (Qdrant)](#step-4--vector-database-qdrant)
-7. [Step 5 — Local LLM (Ollama)](#step-5--local-llm-ollama)
-8. [Step 6 — Google (Gmail + Calendar)](#step-6--google-gmail--calendar)
-9. [Step 7 — Personality file](#step-7--personality-file)
-10. [Step 8 — Configure .env](#step-8--configure-env)
-11. [Step 9 — First run](#step-9--first-run)
-12. [Step 10 — Run as a service (optional)](#step-10--run-as-a-service-optional)
-13. [Step 11 — Optional features](#step-11--optional-features)
-14. [Troubleshooting](#troubleshooting)
-15. [Getting help](#getting-help)
+Install Python **3.12**. Windows users should include the Python launcher when installing Python. [Python downloads](https://www.python.org/downloads/)
 
----
+**Download the ZIP (easiest).** Download and fully extract the archive into a folder you can keep. Open the extracted folder containing `main.py` and `requirements.txt`. On Windows, click the File Explorer address bar, type `powershell` and press Enter. On macOS/Linux, open Terminal, type `cd ` (with a space), drag the extracted folder into the window and press Return. Continue to step 2. [Download MyGG ZIP](https://github.com/pedropedropedropedrop/MyGG/archive/refs/heads/main.zip)
 
-## 1. What you'll end up with
+**Or clone with Git.** If you prefer updates via `git pull`, install Git and run these commands in PowerShell or Terminal. [Git downloads](https://git-scm.com/downloads)
 
-When you finish this guide, you will have:
-
-- A Telegram bot (your own, with whatever name you choose) that responds
-  only to you.
-- A Python process running on your computer that talks to that bot,
-  Claude, your Google account, and a local memory store.
-- Qdrant running in a Docker container, holding everything the assistant
-  has remembered about you.
-- Ollama running in the background, providing the small local model that
-  decides what is worth remembering.
-- (Optional) WHOOP integration, weather, WhatsApp read-only access, voice
-  responses.
-
-You can chat with your bot from anywhere with Telegram installed. The
-heavy lifting happens on your machine — if your machine is off, the bot is
-off. (Step 10 covers running it as an always-on background service.)
-
----
-
-## 2. Prerequisites
-
-You will need accounts and software. Get these set up before you start:
-
-### Software
-
-| What             | Why                                       | Where to get it                                              |
-| ---------------- | ----------------------------------------- | ------------------------------------------------------------ |
-| Python 3.12+     | The bot runtime.                          | https://www.python.org/downloads/                            |
-| Git              | To clone this repo.                       | https://git-scm.com/downloads                                |
-| Docker Desktop   | Runs Qdrant locally.                      | https://www.docker.com/products/docker-desktop/              |
-| Ollama           | Runs a small local LLM for memory.        | https://ollama.com                                           |
-| Node.js 20+      | Only needed for WhatsApp bridge.          | https://nodejs.org                                           |
-
-The instructions assume **Windows 10/11**. macOS and Linux work fine — the
-only real differences are file paths, the service-installer step, and how
-you start Docker. Where it matters, the differences are called out.
-
-### Accounts
-
-| What                  | Required?         | Notes                                              |
-| --------------------- | ----------------- | -------------------------------------------------- |
-| Telegram              | Yes               | Free. Install on your phone or use Telegram Web.   |
-| Anthropic API         | Yes — and **paid**. | https://console.anthropic.com — small balance is enough to start (5–10 USD). |
-| Google account        | Recommended       | For Gmail + Calendar tools.                        |
-| OpenWeatherMap        | Optional          | Free tier. https://openweathermap.org/api          |
-| WHOOP developer       | Optional          | Free. https://developer.whoop.com (only if you wear a WHOOP). |
-
----
-
-## Step 1 — Clone the repo and install dependencies
-
-Open a terminal in the folder where you want to keep the project. On
-Windows that is PowerShell or Windows Terminal.
-
-```powershell
-git clone https://github.com/YOUR-USERNAME/MyGG.git
+```sh
+git clone https://github.com/pedropedropedropedrop/MyGG.git
 cd MyGG
 ```
 
-Create a Python virtual environment so dependencies don't pollute your
-system Python:
+### 2. Install the base packages
+
+**Windows PowerShell**
 
 ```powershell
-# Windows
-python -m venv venv
-venv\Scripts\activate
+py -3.12 -m venv venv
+Set-Alias python "$PWD\venv\Scripts\python.exe"
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-```bash
-# macOS / Linux
-python3 -m venv venv
+**macOS or Linux**
+
+```sh
+python3.12 -m venv venv
 source venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-You should see `(venv)` at the start of your prompt. Now install the
-Python dependencies:
+Leave this terminal open. All remaining `python` commands work as written. Each time you open a new terminal in this folder, repeat the `Set-Alias` line (Windows) or `source venv/bin/activate` (macOS/Linux).
 
-```powershell
-pip install --upgrade pip
-pip install -r requirements.txt
+### 3. Connect Telegram
+
+1. In Telegram, open the verified **@BotFather**, send `/newbot`, choose a display name and a unique username ending in `bot`. Copy the token it gives you. [Telegram's bot guide](https://core.telegram.org/bots/tutorial)
+2. Find your personal numeric Telegram ID. One way is to message **@userinfobot** from your account and read the ID it returns. Your numeric ID and your bot token are different values. Only enter the token in your own installation.
+3. Open **`.env`** in a text editor. From your terminal, use `notepad .env` on Windows, `open -e .env` on macOS, or `nano .env` on Linux. Replace the values in the existing lines as shown below, using your real token and ID. Use your personal ID on both ID lines if you want scheduled briefings. You can leave `OWNER_CHAT_ID=` blank to turn them off.
+
+```dotenv
+TELEGRAM_BOT_TOKEN=PASTE_YOUR_BOT_TOKEN_HERE
+ALLOWED_USER_IDS=YOUR_NUMERIC_TELEGRAM_ID
+OWNER_CHAT_ID=YOUR_NUMERIC_TELEGRAM_ID
+USER_NAME=Alex
+TIMEZONE=America/New_York
 ```
 
-This pulls down `python-telegram-bot`, `anthropic`, `mem0ai`, the Google
-client libraries, `faster-whisper`, `edge-tts`, and a few others. It will
-take a couple of minutes.
+Use a timezone such as `America/Chicago` or `Europe/London`. Each person should run their own copy. Anyone you add to your allowlist shares access to the same connected accounts and stored data.
 
-> **Note on faster-whisper and CUDA:** if you have an NVIDIA GPU,
-> faster-whisper will use it automatically and voice notes will transcribe
-> in seconds. If you do not have a GPU, set `WHISPER_DEVICE=cpu` and
-> consider `WHISPER_MODEL=small` in `.env` later — large-v3 on CPU is slow.
+## Choose a chat model
 
----
+**Claude (default).** Create an API key in your Anthropic Console and enable API billing. A Claude chat subscription alone does not provide API credit. Set `LLM_BACKEND=anthropic` and paste the key into `ANTHROPIC_API_KEY` in `.env`. Chat and scheduled AI work use your API account. [Anthropic Console](https://console.anthropic.com/) · [Claude API guide](https://platform.claude.com/docs/en/api/overview)
 
-## Step 2 — Telegram bot
+**Ollama (local).** Install Ollama on the same computer and start it. Download the default tool-capable model and check it is installed. If the service is stopped, start the Ollama application or run `ollama serve` in a separate terminal. [Ollama setup](https://docs.ollama.com/quickstart) · [Default model and download size](https://ollama.com/library/qwen3:8b)
 
-You need to register a bot with Telegram and get its token.
+```sh
+ollama pull qwen3:8b
+ollama list
+```
 
-1. Open Telegram. Search for **@BotFather** and start a chat.
-2. Send `/newbot`.
-3. BotFather will ask for a display name (anything works — e.g.
-   "Alex's Assistant").
-4. Then it will ask for a username — must end in `bot`, e.g.
-   `alex_assistant_bot`.
-5. BotFather will reply with a token that looks like
-   `1234567890:ABCD-1234abcd_efghEFGH-IJklmnopqrstuvw`.
-   **This is your `TELEGRAM_BOT_TOKEN`.** Copy it somewhere safe.
+Set these lines in `.env`. You can leave `ANTHROPIC_API_KEY` empty.
 
-Now find your own Telegram user ID:
+```dotenv
+LLM_BACKEND=local
+LOCAL_MODEL=qwen3:8b
+```
 
-1. In Telegram, search for **@userinfobot** and start a chat.
-2. Send any message; the bot replies with your user ID (a 9- or
-   10-digit number). **This is your `OWNER_CHAT_ID` and your single entry
-   for `ALLOWED_USER_IDS`.**
+Local chat uses Ollama's service on port 11434. GG also routes meeting analysis, briefings and WhatsApp summaries through the local model. It supports text uploads and transcribed voice. Select Claude when you need images, PDFs, Anthropic web tools, hosted code execution or Edge speech output. Local mode still uses Telegram and any external accounts you connect.
 
-> **Why does this matter?** `ALLOWED_USER_IDS` is the bot's gatekeeper. If
-> someone else finds your bot's username and messages it, the bot will
-> ignore them unless their ID is in this list. **Do not leave this blank.**
+If tool calls drop details or replies are cut off, check the model's context window with `ollama ps` while it is loaded. If it is below 16K, set `OLLAMA_CONTEXT_LENGTH=16384` in the **Ollama server environment** and restart Ollama. A larger window uses more memory. [Ollama context length](https://docs.ollama.com/context-length) · [Set Ollama environment variables on your OS](https://docs.ollama.com/faq#how-do-i-configure-ollama-server)
 
----
+## First conversation
 
-## Step 3 — Anthropic API key
+1. Save `.env`. From the MyGG folder run `python validate.py` using the virtual environment from step 2. Correct any reported setup errors, then run `python main.py`. Keep the terminal open.
+2. Open a **private chat** with your own bot and send **`/start`**. A greeting confirms the Telegram connection and your access. Send **`/model`** to see the selected model.
+3. Send **“Add a to-do to try GG tomorrow”**, then **“Show my to-dos.”** Seeing the item confirms model access and local storage. Try **“Remind me in two minutes to stretch”** with the bot running to test reminders.
 
-1. Go to https://console.anthropic.com and sign up / sign in.
-2. Add a payment method and a small amount of credit (5–10 USD goes a long way).
-3. Click **API keys** → **Create Key**.
-4. Copy the key (starts with `sk-ant-...`). **This is your `ANTHROPIC_API_KEY`.**
+Press **Ctrl+C** in the terminal to stop GG. Run the same command to start again. Restart GG after editing `.env`. In Claude mode, `/opus` changes the chat to Opus, `/sonnet` restores the default, and a message starting with `!!` requests Opus for one turn.
 
-> **Cost expectation:** typical usage with Sonnet is fractions of a cent
-> per message. Heavy days with big briefings might be tens of cents.
-> Anthropic's dashboard shows your spend.
+## Optional features
 
----
+### Personalize GG
 
-## Step 4 — Vector database (Qdrant)
+Copy `personality.md.example` to `personality.md` beside `main.py`. Edit it with facts and preferences you want GG to use, such as “Use short replies” or “Suggest meetings after 10 a.m.” That text becomes part of the chat model's prompt. Keep passwords and account keys in their designated configuration fields.
 
-Qdrant is the database where mem0 stores your assistant's long-term memory.
+### Briefings
 
-1. Make sure Docker Desktop is running. (Open it; wait for the green
-   "Engine running" indicator.)
-2. In a terminal, start Qdrant:
+Set `OWNER_CHAT_ID` to your own allowlisted Telegram ID and set `TIMEZONE` in `.env`. Start the private chat once and leave GG running. The morning briefing is scheduled for **7:30 a.m.** and the evening wrap-up for **9 p.m.** in your chosen timezone. Connecting Google enables upcoming-meeting alerts. Weather and WHOOP add context when those accounts are configured.
 
-   **Windows PowerShell:**
-   ```powershell
-   docker run -d --name mygg-qdrant `
-     -p 6333:6333 -p 6334:6334 `
-     -v ${PWD}\qdrant_storage:/qdrant/storage:z `
-     qdrant/qdrant
-   ```
+### Long-term memory
 
-   **macOS / Linux:**
-   ```bash
-   docker run -d --name mygg-qdrant \
-     -p 6333:6333 -p 6334:6334 \
-     -v "$(pwd)"/qdrant_storage:/qdrant/storage:z \
-     qdrant/qdrant
-   ```
+To-dos and reminders already persist in a local SQLite file. Add semantic memory if you want GG to recall facts from earlier conversations.
 
-3. Verify it's reachable: open http://localhost:6333/dashboard in your
-   browser. You should see Qdrant's UI.
+1. Install and start Ollama and Docker. Docker Desktop is one way to run Docker on Windows or macOS. [Ollama](https://docs.ollama.com/quickstart) · [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+2. From the project folder install the memory packages and download the extraction and embedding models.
 
-The `qdrant_storage/` directory holds the actual vectors — back it up if
-you care about preserving long memories. It is gitignored.
-
-> **No Docker?** Qdrant Cloud has a free tier
-> (https://cloud.qdrant.io). Set `QDRANT_HOST` and `QDRANT_PORT` in your
-> `.env` to point at the cloud cluster.
-
----
-
-## Step 5 — Local LLM (Ollama)
-
-Ollama runs the small model mem0 uses to decide what should be remembered
-and the embedding model that turns text into vectors.
-
-1. Install Ollama from https://ollama.com (binary installer for Windows,
-   macOS, Linux).
-2. After installation, pull the two models MyGG needs:
-
-   ```bash
+   ```sh
+   python -m pip install -r requirements/memory.txt
    ollama pull qwen3:8b
    ollama pull nomic-embed-text
    ```
 
-   `qwen3:8b` is around 5 GB; `nomic-embed-text` is around 270 MB. The
-   pull-down takes a few minutes on a normal connection.
+3. Start a Qdrant container on the loopback interface. The named Docker volume keeps memories across container restarts. A returning user should start their existing container to keep its existing storage. [Qdrant local setup](https://qdrant.tech/documentation/quickstart/)
 
-3. Confirm Ollama is running:
-
-   ```bash
-   curl http://localhost:11434/api/tags
+   ```sh
+   docker run -d --name mygg-qdrant --restart unless-stopped -p 127.0.0.1:6333:6333 -v mygg-qdrant-data:/qdrant/storage qdrant/qdrant
    ```
 
-   You should see JSON listing the two models.
+4. Open `http://127.0.0.1:6333/dashboard` locally to check Qdrant. Set `ENABLE_MEMORY=true` in `.env` and restart GG. Keep Ollama and Qdrant running.
+5. Send **“Remember that my favorite tea is jasmine.”** Restart GG and ask **“What is my favorite tea?”** The restart clears the short chat history, so this tests long-term recall.
 
-> **Low-VRAM machines:** if `qwen3:8b` is too big for your GPU, swap it
-> for `llama3.1:8b-instruct-q4_K_M` or `mistral:7b` and update
-> `OLLAMA_MEMORY_MODEL` in `.env`.
+### Voice and meetings
 
----
+1. Run `python -m pip install -r requirements/voice.txt` and restart GG. For a typical laptop, use `WHISPER_DEVICE=cpu` and `WHISPER_MODEL=small`. On first use, Whisper downloads the model. NVIDIA users who have installed the matching CUDA libraries can select `cuda`. [Whisper installation and GPU requirements](https://github.com/SYSTRAN/faster-whisper)
+2. Send a short voice note and check GG's reply. In Claude mode, ask **“Read that back to me as a voice note.”** Edge TTS sends the reply text to Microsoft's speech service. Set `TTS_VOICE` to choose a voice.
+3. To create meeting notes, attach a recording as an audio document. Voice notes over 30 seconds also enter meeting processing. Add a caption for context. GG saves the transcript in `meeting_transcripts/`, extracts decisions and can add your action items to the to-do list. Try **“Show my latest meeting notes.”**
 
-## Step 6 — Google (Gmail + Calendar)
+### Google Calendar and Gmail
 
-This grants MyGG read/write access to your Gmail and Calendar. The token
-lives only on your machine.
+1. Create a project in Google Cloud. Enable **Google Calendar API** and **Gmail API**. Configure the OAuth consent screen. If the app is in testing, add your Google account as a test user. [Calendar setup](https://developers.google.com/workspace/calendar/api/quickstart/python) · [Gmail setup](https://developers.google.com/workspace/gmail/api/quickstart/python)
+2. Create an **OAuth client ID** of type **Desktop app**. Download its JSON and save it as `credentials.json` beside `main.py`.
+3. Run `python setup_calendar.py` on the computer running GG. In the browser, select the account you want to connect, review the requested Calendar and Gmail permissions, and approve. The helper uses a temporary callback on port 8090 and saves `token.json`.
+4. Restart GG. Ask **“What's on my calendar tomorrow?”** or **“List my last three unread emails.”** To test outgoing email, ask GG to send a message to yourself. In the private Telegram preview, review the recipient and content, then choose **Send** or **Cancel**. Replies and calendar events with guests also require approval. Only the newest preview in that chat is valid, for ten minutes. Restarting clears pending approvals.
 
-1. Open **Google Cloud Console** → https://console.cloud.google.com.
-2. Create a new project (top-left dropdown → "New Project"). Name it
-   anything — e.g. "MyGG".
-3. **Enable the APIs**: search for and enable both
-   **Google Calendar API** and **Gmail API** in
-   *APIs & Services → Library*.
-4. **Configure the OAuth consent screen**:
-   - User Type: **External**
-   - App name: anything
-   - Support email: your email
-   - Add yourself as a **Test user** (your Gmail address)
-   - Save and continue through all screens
-5. **Create OAuth credentials**:
-   - *APIs & Services → Credentials → Create Credentials → OAuth client ID*
-   - Application type: **Desktop app**
-   - Name: anything
-   - Click **Create**, then **Download JSON**
-   - Save the downloaded file as **`credentials.json`** in the MyGG
-     project root (next to `main.py`).
+To connect a second account, add `GOOGLE_EXTRA_ACCOUNTS=work` to `.env`. Optionally set `GOOGLE_ACCOUNT_WORK_LABEL=Work`. Run `python setup_calendar.py work`, sign in to that account and restart GG. Ask **“Show tomorrow's events on my work calendar.”** For several accounts, list their names separated by commas. Start each name with a lowercase letter and use lowercase letters, digits or underscores.
 
-Now run the OAuth flow:
+### Weather
 
-```bash
-python setup_calendar.py
-```
-
-A browser window will open. Sign in with your Google account, click
-"Continue" on the unverified-app warning (it's your own app — click
-**Advanced → Go to MyGG (unsafe)**), and grant the requested permissions.
-
-When it succeeds you'll see "Authorization successful! Token saved to
-token.json". You can close the browser tab.
-
-> **Adding a second account later** (e.g. work + personal): edit
-> `setup_calendar.py` and `tools.py` to add a second entry, then run
-> `python setup_calendar.py work` (or whatever name you chose).
-
----
-
-## Step 7 — Personality file
-
-`personality.md` is the heart of how your assistant knows you. Anything
-in this file is loaded directly into the system prompt on every message.
-
-Copy the example and edit it:
-
-```bash
-cp personality.md.example personality.md
-```
-
-Open `personality.md` in any text editor and customize. Sections to fill in:
-
-- **About me** — name, role, location.
-- **What I'm focused on** — your projects, hobbies, recurring commitments.
-- **People in my life** — partner, kids, top clients, friends. The
-  assistant will remember these and use them.
-- **Email accounts** — which address you use for what.
-- **Communication preferences** — tone, do's and don'ts, when to be quiet.
-
-Keep it focused and concise. Bullet points are great. Anything you
-include affects every response, so every line should pay rent.
-
----
-
-## Step 8 — Configure .env
-
-Copy the template and fill in the values you collected above:
-
-```bash
-cp .env.example .env
-```
-
-Open `.env` in your text editor. At a minimum, set:
-
-```env
-TELEGRAM_BOT_TOKEN=12345...      # from BotFather (Step 2)
-ANTHROPIC_API_KEY=sk-ant-...     # from Anthropic console (Step 3)
-ALLOWED_USER_IDS=123456789       # your Telegram user ID (Step 2)
-OWNER_CHAT_ID=123456789          # same number, single value
-USER_NAME=Alex                   # how the assistant addresses you
-TIMEZONE=America/New_York        # your timezone
-```
-
-Optional sections (audio, WhatsApp, weather, WHOOP) can stay blank for
-now — fill them in later when you set up those features.
-
----
-
-## Step 9 — First run
-
-In your activated venv, with Docker (Qdrant) and Ollama both running:
-
-```bash
-python main.py
-```
-
-You should see log lines like:
-
-```
-[main] INFO: Database initialized
-[main] INFO: Pre-loading Whisper model...
-[main] INFO: Loaded modules: meetings, weather, whoop
-[main] INFO: WhatsApp HTTP server will start on port 8787
-[main] INFO: Bot starting...
-```
-
-Now open Telegram, find the bot you created, send `/start`. You should
-get a greeting back.
-
-Try a few things:
-
-- "What's on my calendar today?"
-- "Add a todo: buy groceries"
-- "Remember that my niece's name is Maya."
-- "What do you know about me?"
-
-If everything works, you have a personal AI assistant. Move on to
-making it permanent.
-
----
-
-## Step 10 — Run as a service (optional)
-
-While `python main.py` works, you probably want the bot to start
-automatically and survive crashes/reboots.
-
-### Windows — nssm
-
-`setup_service.bat` registers MyGG as a Windows service via
-[nssm](https://nssm.cc).
-
-1. Install nssm: `winget install nssm.nssm` (or download from
-   https://nssm.cc and add to PATH).
-2. Right-click on PowerShell, **Run as administrator**.
-3. From the project root:
-   ```powershell
-   .\setup_service.bat
-   ```
-4. Answer **Y** to start the service immediately.
-
-The service is named **MyGG**. Logs go to `.\logs\mygg.log`. Common
-commands:
-
-```powershell
-nssm start MyGG
-nssm stop MyGG
-nssm restart MyGG
-nssm status MyGG
-nssm remove MyGG confirm
-```
-
-### macOS — launchd
-
-Create `~/Library/LaunchAgents/com.mygg.bot.plist` with the equivalent of:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.mygg.bot</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/YOU/MyGG/venv/bin/python</string>
-    <string>/Users/YOU/MyGG/main.py</string>
-  </array>
-  <key>WorkingDirectory</key><string>/Users/YOU/MyGG</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/YOU/MyGG/logs/mygg.log</string>
-  <key>StandardErrorPath</key><string>/Users/YOU/MyGG/logs/mygg-error.log</string>
-</dict>
-</plist>
-```
-
-Load it with `launchctl load ~/Library/LaunchAgents/com.mygg.bot.plist`.
-
-### Linux — systemd
-
-`/etc/systemd/system/mygg.service`:
-
-```ini
-[Unit]
-Description=MyGG Personal AI Assistant
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/home/you/MyGG
-ExecStart=/home/you/MyGG/venv/bin/python /home/you/MyGG/main.py
-Restart=on-failure
-RestartSec=5
-User=you
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then `sudo systemctl daemon-reload && sudo systemctl enable --now mygg`.
-
-> **Don't forget:** Qdrant (Docker) and Ollama also need to start at
-> boot. Docker Desktop and Ollama both have "start on login" options in
-> their settings; turn them on.
-
----
-
-## Step 11 — Optional features
+Create an OpenWeatherMap API key and set `OPENWEATHER_API_KEY` in `.env`. Set `DEFAULT_LOCATION` to a city and country, such as `London,GB`. Restart and ask **“What's the weather?”** Sharing a location in Telegram updates the location GG uses. [OpenWeatherMap](https://openweathermap.org/api)
 
 ### WHOOP
 
-If you wear a WHOOP and want sleep/recovery/strain in your morning briefings:
+Register a WHOOP developer app with the redirect URI `http://localhost:8788/callback`. In `.env`, set `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET` and `WHOOP_REDIRECT_URI` to the matching values. Run `python whoop_auth.py`, complete consent in the browser and restart GG. Ask **“What was my last WHOOP recovery score?”** The OAuth helper stores the grant in `.whoop_token.json`. [WHOOP developer guide](https://developer.whoop.com/docs/developing/oauth/)
 
-1. Register an app at https://developer.whoop.com.
-2. Set the redirect URI to `http://localhost:8788/callback`.
-3. Put the client ID and secret into `.env`:
-   ```env
-   WHOOP_CLIENT_ID=...
-   WHOOP_CLIENT_SECRET=...
-   WHOOP_REDIRECT_URI=http://localhost:8788/callback
-   ```
-4. Run the OAuth helper once:
-   ```bash
-   python whoop_auth.py
-   ```
-5. Restart MyGG. The morning briefing will now include recovery + sleep.
+### WhatsApp
 
-### WhatsApp (read-only)
+The optional read-only bridge links as a WhatsApp device and stores new messages and captions it receives while running. It skips offline history. You can search that local message history immediately. With long-term memory enabled, a scheduled summary also processes messages through your selected model and saves relevant context.
 
-Lets MyGG search your WhatsApp messages and summarize chats.
+1. Install Node.js 22.12 or newer with npm. From the MyGG folder run `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Paste the generated value into `WHATSAPP_BRIDGE_SECRET` in the project's `.env`. Both processes read this same file. [Node.js downloads](https://nodejs.org/en/download)
+2. Restart GG. In a **second terminal** inside the MyGG folder, run the following commands and leave it open.
 
-1. Install Node.js 20+.
-2. From the `whatsapp-bridge/` directory:
-   ```bash
+   ```sh
    cd whatsapp-bridge
-   npm install
+   npm ci
+   npm start
    ```
-3. Pick a long random string for `WHATSAPP_BRIDGE_SECRET` and put it in
-   `.env` of the **MyGG project root** *and* in `whatsapp-bridge/.env`
-   (create it if needed) — both sides need the same value.
-4. Start the bridge:
-   ```bash
-   node index.js
-   ```
-5. The first run prints a QR code (or saves `qr.png`). Open WhatsApp on
-   your phone → Settings → Linked Devices → Link Device, scan it.
-6. Restart MyGG. Try: "summarize my WhatsApp from the last 12 hours".
 
-> **Important:** the bridge must keep running for messages to flow in.
-> Consider running it via `nssm`, `pm2`, or a systemd service alongside
-> the main bot.
+3. When pairing is requested, open the QR image `whatsapp-bridge/qr.png` on the computer. On your phone, go to WhatsApp's **Linked devices → Link a device** and scan it. The bridge saves its session in `whatsapp-bridge/auth_state/`.
+4. After a new test message arrives, ask GG **“Summarize my WhatsApp from the last hour.”** Keep the Python bot and bridge running. If the Python receiver is unavailable, the bridge keeps messages in `whatsapp-bridge/pending-delivery/` and retries. To disconnect, stop the bridge and unlink it under **Linked devices** on your phone.
 
-### Weather (OpenWeatherMap)
+### Keep GG running
 
-1. Sign up at https://openweathermap.org/api.
-2. Copy your API key into `.env` as `OPENWEATHER_API_KEY`.
-3. Optionally set `DEFAULT_LOCATION="City, ST"`.
-4. Restart MyGG. The morning briefing now includes today's weather.
+For regular use, leave the foreground terminal open or use the Windows launcher `.\start-gg.ps1` from the project folder. A sleeping computer pauses the bot. For automatic startup on Windows, first verify the foreground setup, install NSSM on your PATH, stop the terminal copy, then run `.\setup_service.bat` from an administrator terminal. It registers a service named `MyGG`. Use `nssm start MyGG`, `nssm status MyGG` and `nssm stop MyGG` to manage it. Service logs are in `logs/`. Start Ollama, Docker and the WhatsApp bridge separately when you use them. [NSSM](https://nssm.cc/download)
 
-### Voice replies (TTS reference)
+## Update an existing installation
 
-By default MyGG uses an Edge TTS voice (`en-IE-EmilyNeural` —
-configurable via `TTS_VOICE`). No setup needed — voice replies just work.
-
-If you want to clone a specific voice, you'll need a different TTS
-backend; that's out of scope here, but `audio.py` is a good place to
-swap in alternatives.
-
----
+1. Stop the bot and bridge. Back up your `.env`, `personality.md`, `pa.db` and any `pa.db-*` files. If connected, also back up transcripts, OAuth files and WhatsApp's `auth_state/` and `pending-delivery/` privately. Keep your existing Qdrant volume or storage directory and its backup.
+2. **Git installations:** From the MyGG folder run `git status --short`. Save any custom code edits before running `git pull --ff-only`. **ZIP installations:** Rename your stopped installation folder as a backup. Extract the new ZIP to the original path, with `main.py` directly inside. Repeat the virtual environment setup in step 2 of [Install MyGG](#install-mygg), then restore the private files from step 1. Keep any existing Qdrant storage at the path used by its container. Reapply any intentional code customizations.
+3. Using this installation's virtual environment, run `python -m pip install -r requirements.txt`. Update each add-on you use with `python -m pip install -r requirements/memory.txt` or `python -m pip install -r requirements/voice.txt`. For WhatsApp run `npm ci` in `whatsapp-bridge/`.
+4. Compare the new `.env.example` with your existing `.env`. **Keep your current file and credentials.** Check the allowed ID, set `OWNER_CHAT_ID` to an allowed ID or blank, and set `ENABLE_MEMORY=true` if using your existing memory store. Preserve your memory collection, model settings and username. Run `python validate.py`, restart your services and repeat the [first conversation](#first-conversation).
 
 ## Troubleshooting
 
-The 10 most common reasons MyGG won't start, in rough order of frequency:
+| Symptom | What to check |
+| --- | --- |
+| Python can't import a package | Run the install command with the same virtual-environment Python that launches `main.py`. On Windows, using `.\venv\Scripts\python.exe` directly bypasses activation problems. |
+| GG is silent | Confirm the terminal is still running. Open a private chat with the bot created by your token, send `/start`, and check the numeric ID in `ALLOWED_USER_IDS`. Only one running process can poll a token. |
+| The greeting works, then the first AI reply fails | Use `/model`. For Claude, check the API key, billing and model access. For local mode, check `ollama list`, the running service and the exact `LOCAL_MODEL` name. |
+| A meeting, image or voice feature fails | Check the model's [supported inputs](#choose-a-chat-model), install voice packages for transcription and allow time for the first download. Use `cpu` if CUDA libraries are missing. |
+| Facts disappear after a restart | Confirm memory is enabled, `docker start mygg-qdrant` can start the existing container, and `ollama list` includes both memory models. Check that the Qdrant volume, collection and username match the original setup. |
+| Google or WHOOP authorization fails | Check the selected Google project, enabled APIs, desktop client and test user. For WHOOP, compare the callback URI character-for-character. Re-run the appropriate authorization helper. |
+| WhatsApp stays empty | Check the linked device, both running terminals and the shared secret. Test with a newly received text after pairing. |
 
-1. **`ConnectionError: ollama is not running`**
-   Start Ollama. On Windows, search "Ollama" in the Start menu and launch
-   the app. Verify with `curl http://localhost:11434/api/tags`.
-
-2. **`Connection refused` on port 6333**
-   Qdrant container isn't running. `docker start mygg-qdrant`. If the
-   container doesn't exist, rerun the `docker run` command from
-   [Step 4](#step-4--vector-database-qdrant).
-
-3. **`401 Unauthorized` from Telegram**
-   Wrong `TELEGRAM_BOT_TOKEN`. Copy-paste it again from BotFather.
-
-4. **`401 Unauthorized` from Anthropic**
-   Wrong `ANTHROPIC_API_KEY`. Make sure there are no quotes or
-   trailing spaces around the value in `.env`.
-
-5. **Google OAuth says "redirect URI mismatch"**
-   In your Google Cloud Console, go to your OAuth client → Authorized
-   redirect URIs and add `http://localhost:8090/`. (`setup_calendar.py`
-   uses port 8090 by default.)
-
-6. **Bot says nothing back when I message it**
-   Check `ALLOWED_USER_IDS`. Send `/start` to **@userinfobot** to confirm
-   your real ID. The value in `.env` must match exactly.
-
-7. **`Whoop API 401`**
-   Token expired and refresh failed. Run `python whoop_auth.py` again.
-
-8. **`ModuleNotFoundError: No module named 'ollama'`** (or `mem0` etc.)
-   You forgot `pip install -r requirements.txt`, or you have multiple
-   Python installations. Make sure your venv is activated — the prompt
-   should start with `(venv)`.
-
-9. **Service install says "permission denied"**
-   `setup_service.bat` (Windows) needs an Administrator PowerShell.
-   Right-click PowerShell → Run as administrator. On Linux, prefix
-   `systemctl` commands with `sudo`.
-
-10. **WhatsApp QR code expired before I could scan it**
-    Stop the bridge (`Ctrl+C`), restart `node index.js`, scan within
-    20 seconds. If the auth state got into a weird place, delete
-    `whatsapp-bridge/auth_state/` and try again.
-
-If you hit something not on this list, the logs in `logs/mygg.log` (or
-the terminal output if you're running `python main.py` directly) will
-usually tell you exactly which integration is broken.
-
----
-
-## Getting help
-
-- **Stuck during install?** Open the entire MyGG folder in Claude Code
-  (https://claude.com/claude-code) and ask: "Help me debug why MyGG
-  won't start. Here are the logs: ...". Claude Code is genuinely good at
-  walking through this kind of integration setup.
-- **Bug?** Open a GitHub issue with the relevant log lines.
-- **Idea?** Open a feature-request issue.
-- **Security concern?** See [SECURITY.md](SECURITY.md).
-
-Welcome to MyGG. Once it knows you, you won't want to live without it.
+For a reproducible problem, include your OS, Python version, backend and a redacted error when opening an issue. Keep tokens, conversations, contact names, OAuth files and QR images private. [Issue tracker](https://github.com/pedropedropedropedrop/MyGG/issues) · [Security reporting](SECURITY.md)

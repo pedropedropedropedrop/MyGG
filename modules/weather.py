@@ -88,7 +88,7 @@ def _save_location(location: str, lat: float | None = None, lon: float | None = 
         data["lat"] = lat
         data["lon"] = lon
     LOCATION_FILE.write_text(json.dumps(data))
-    logger.info(f"Saved current location: {location}")
+    logger.info("Updated the saved weather location")
 
 
 def _load_location() -> dict:
@@ -126,9 +126,9 @@ async def update_location_from_gps(lat: float, lon: float) -> str:
 
         summary = _format_weather(data)
         return f"Location updated to {location_name}.\n\n{summary}"
-    except Exception as e:
-        logger.exception("GPS location update failed")
-        return f"Could not update location from GPS: {e}"
+    except Exception as exc:
+        logger.warning("GPS weather lookup failed (%s)", type(exc).__name__)
+        return "Could not look up that location. Check your weather API key and connection."
 
 
 TOOL_DEFINITIONS = [
@@ -177,15 +177,16 @@ async def _handle_get_weather(input_data: dict) -> str:
         return "Weather unavailable: OPENWEATHER_API_KEY is not set in the environment."
 
     lat, lon = None, None
-    if location:
-        _save_location(location)
-    else:
+    new_location = bool(location)
+    if not new_location:
         saved = _load_location()
         location = saved["location"]
         lat, lon = saved.get("lat"), saved.get("lon")
 
     try:
         data = await _fetch_weather(location, lat, lon)
+        if new_location:
+            _save_location(location)
         return _format_weather(data)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 401:
@@ -195,16 +196,13 @@ async def _handle_get_weather(input_data: dict) -> str:
                 f"Location not found: '{location}'. "
                 "Try a more specific name, e.g. 'Miami, FL' or 'London, UK'."
             )
-        return (
-            f"OpenWeatherMap API error {exc.response.status_code}: "
-            f"{exc.response.text[:200]}"
-        )
+        return f"OpenWeatherMap returned HTTP {exc.response.status_code}."
     except httpx.RequestError as exc:
-        logger.exception("Weather network error")
-        return f"Network error fetching weather: {exc}"
+        logger.warning("Weather request failed (%s)", type(exc).__name__)
+        return "Could not connect to OpenWeatherMap. Check the connection and try again."
     except Exception as exc:
-        logger.exception("Unexpected weather error")
-        return f"Failed to fetch weather: {exc}"
+        logger.warning("Weather lookup failed (%s)", type(exc).__name__)
+        return "Could not read this weather report."
 
 
 # ── heartbeat ─────────────────────────────────────────────────────────────────
@@ -218,6 +216,6 @@ async def heartbeat_contributions() -> str | None:
         saved = _load_location()
         data = await _fetch_weather(saved["location"], saved.get("lat"), saved.get("lon"))
         return _one_line_summary(data)
-    except Exception:
-        logger.exception("Weather heartbeat contribution failed")
+    except Exception as exc:
+        logger.warning("Weather briefing lookup failed (%s)", type(exc).__name__)
         return None

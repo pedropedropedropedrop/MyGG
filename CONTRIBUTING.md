@@ -8,14 +8,14 @@ By participating you agree to abide by the [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## Reporting bugs
 
-Open a [GitHub issue](../../issues/new/choose) using the **Bug Report**
+Open a [GitHub issue](https://github.com/pedropedropedropedrop/MyGG/issues/new/choose) using the **Bug Report**
 template. Please include:
 
 - What you expected to happen.
 - What actually happened.
-- A minimal repro (one or two messages, the exact `.env` keys you used,
-  Python version, OS).
-- Relevant log lines from `logs/mygg.log` (redact tokens).
+- A minimal reproduction with sample text, the selected chat backend,
+  Python version and OS.
+- Relevant redacted error lines. Remove tokens, emails, message contents and personal IDs.
 
 ## Suggesting features
 
@@ -35,11 +35,11 @@ Open a **Feature Request** issue. The most useful feature requests:
 2. Make small, focused commits. Use [conventional commits](https://www.conventionalcommits.org/)
    when it's natural (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`),
    but a clear plain-English message is fine too.
-3. Verify your changes locally:
+3. Use the project's virtual-environment Python to install the test runner and check your changes.
    ```bash
-   python -m py_compile $(git ls-files '*.py')
-   pytest tests/                       # if you added tests
-   python validate.py                  # full module-discovery sanity check
+   python -m pip install pytest
+   python -m pytest tests/
+   python validate.py
    ```
 4. Push and open a PR against `main`. Use the PR template.
 
@@ -50,7 +50,7 @@ fast merges.
 
 Follow [ONBOARDING.md](ONBOARDING.md) once to get a working bot. Then:
 
-- Activate the venv (`venv\Scripts\activate` on Windows).
+- Use `.\venv\Scripts\python.exe` on Windows or activate the venv with `source venv/bin/activate` on macOS/Linux.
 - Run `python main.py` to start the bot in the foreground.
 - Edit code; restart the process to pick up changes.
 - For module-only changes, `python validate.py` is a fast sanity check.
@@ -112,14 +112,12 @@ A "module" is a self-contained capability — Whoop, Weather, etc. To add one:
 
 ## Tests
 
-We don't have a comprehensive test suite (yet). The existing tests live
-in `tests/` and cover module discovery and a few helpers. If you add
-non-trivial logic, please ship a test.
+The regression suite lives in `tests/`. Add a focused case when changing access rules, model routing, or module behavior.
 
 Run with:
 
 ```bash
-pytest tests/
+python -m pytest tests/
 ```
 
 ## Final note

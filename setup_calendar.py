@@ -1,40 +1,17 @@
-"""Google OAuth authorization for Calendar + Gmail.
+"""Authorize Google Calendar and Gmail for the default or a named account.
 
-Usage:
-  python setup_calendar.py             # Setup the default 'personal' account
-  python setup_calendar.py <name>      # Setup an additional named account
-
-To enable a second account (e.g. 'work'):
-  1. Add the entry to the ACCOUNTS dict below.
-  2. Add the matching entry to GOOGLE_ACCOUNTS in tools.py.
-  3. Run `python setup_calendar.py work` to authorize and write the token file.
-
-Both ACCOUNTS (here) and GOOGLE_ACCOUNTS (in tools.py) need the same key.
+Use python setup_calendar.py for your personal account. For a second account,
+set GOOGLE_EXTRA_ACCOUNTS=work in .env and run python setup_calendar.py work.
 """
 
-import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
-
-ACCOUNTS = {
-    "personal": {
-        "token_path": Path(__file__).parent / "token.json",
-        "label": os.getenv("GOOGLE_ACCOUNT_LABEL", "Personal Google account"),
-    },
-    # To add a second account, mirror this entry and the one in tools.py:
-    # "work": {
-    #     "token_path": Path(__file__).parent / "token_work.json",
-    #     "label": os.getenv("GOOGLE_ACCOUNT_WORK_LABEL", "Work account"),
-    # },
-}
+load_dotenv(Path(__file__).with_name(".env"))
+from tools import GOOGLE_ACCOUNTS, GOOGLE_SCOPES
+from utils import write_secret_file
 
 CREDS_PATH = Path(__file__).parent / "credentials.json"
 
@@ -42,12 +19,11 @@ CREDS_PATH = Path(__file__).parent / "credentials.json"
 def main():
     account = sys.argv[1] if len(sys.argv) > 1 else "personal"
 
-    if account not in ACCOUNTS:
-        print(f"Unknown account '{account}'. Available: {', '.join(ACCOUNTS.keys())}")
-        print("To add a new account, edit ACCOUNTS in setup_calendar.py and GOOGLE_ACCOUNTS in tools.py.")
-        return
-
-    acct = ACCOUNTS[account]
+    if account not in GOOGLE_ACCOUNTS:
+        print(f"Unknown account '{account}'. Available: {', '.join(GOOGLE_ACCOUNTS)}")
+        print("Add the account name to GOOGLE_EXTRA_ACCOUNTS in .env first.")
+        raise SystemExit(1)
+    acct = GOOGLE_ACCOUNTS[account]
     print(f"Setting up: {acct['label']}")
     print(f"Token will be saved to: {acct['token_path']}")
 
@@ -61,13 +37,12 @@ def main():
             "5. Download the JSON and save it as credentials.json in this folder\n"
             "6. Run this script again"
         )
-        return
-
+        raise SystemExit(1)
     print(f"\nA browser window will open. Sign in with the {acct['label']} account.\n")
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), GOOGLE_SCOPES)
     creds = flow.run_local_server(port=8090, open_browser=True)
-    acct["token_path"].write_text(creds.to_json())
+    write_secret_file(acct["token_path"], creds.to_json())
     print(f"\nAuthorization successful! Token saved to {acct['token_path']}")
 
 

@@ -10,7 +10,12 @@ venv/
 
 # Secrets and credentials — NEVER commit these.
 .env
+.env.*
+!.env.example
+.mygg-secret-*
 *.db
+*.db-*
+*.sqlite*
 token*.json
 .whoop_token.json
 credentials.json
@@ -24,6 +29,7 @@ voice_reference.wav
 .current_location
 .evolution_result
 qdrant_storage/
+whatsapp-bridge/pending-delivery/
 
 # Personality file is intentionally per-user — don't commit.
 personality.md

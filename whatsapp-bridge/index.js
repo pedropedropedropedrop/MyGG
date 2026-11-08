@@ -1,6 +1,5 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require("baileys");
 const pino = require("pino");
-const http = require("http");
+const { DeliveryQueue, postJson } = require("./delivery-queue");
 const path = require("path");
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -10,53 +9,24 @@ require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const PYTHON_PORT = process.env.WHATSAPP_BRIDGE_PORT || "8787";
 const PYTHON_URL = `http://127.0.0.1:${PYTHON_PORT}/whatsapp/incoming`;
-const BRIDGE_SECRET = process.env.WHATSAPP_BRIDGE_SECRET || "";
+const BRIDGE_SECRET = (process.env.WHATSAPP_BRIDGE_SECRET || "").trim();
 const AUTH_DIR = path.join(__dirname, "auth_state");
 
 const logger = pino({ level: "info" });
+if (!BRIDGE_SECRET) {
+  logger.error("Set WHATSAPP_BRIDGE_SECRET in the project .env before pairing WhatsApp");
+  process.exit(1);
+}
 
-// ── HTTP POST helper with retry ─────────────────────────────────────────────
+const deliveryQueue = new DeliveryQueue({
+  directory: path.join(__dirname, "pending-delivery"),
+  deliver: (data) => postJson(data, { url: PYTHON_URL, secret: BRIDGE_SECRET }),
+  logger,
+});
 
-async function postMessage(data) {
-  const body = JSON.stringify(data);
-  const headers = {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-  };
-  if (BRIDGE_SECRET) {
-    headers["Authorization"] = `Bearer ${BRIDGE_SECRET}`;
-  }
-
-  const delays = [1000, 2000, 4000]; // exponential backoff
-  for (let attempt = 0; attempt <= delays.length; attempt++) {
-    try {
-      await new Promise((resolve, reject) => {
-        const url = new URL(PYTHON_URL);
-        const req = http.request(
-          { hostname: url.hostname, port: url.port, path: url.pathname, method: "POST", headers },
-          (res) => {
-            let responseBody = "";
-            res.on("data", (chunk) => (responseBody += chunk));
-            res.on("end", () => {
-              if (res.statusCode === 200) resolve();
-              else reject(new Error(`HTTP ${res.statusCode}: ${responseBody}`));
-            });
-          }
-        );
-        req.on("error", reject);
-        req.write(body);
-        req.end();
-      });
-      return; // success
-    } catch (err) {
-      if (attempt < delays.length) {
-        logger.warn({ err: err.message, attempt: attempt + 1 }, "POST failed, retrying...");
-        await new Promise((r) => setTimeout(r, delays[attempt]));
-      } else {
-        logger.error({ err: err.message }, "POST failed after all retries, dropping message");
-      }
-    }
-  }
+function stopForDeliveryError(error) {
+  logger.fatal({ err: error.message }, "Delivery queue failed; existing pending messages are preserved");
+  process.exit(1);
 }
 
 // ── Extract text from message ───────────────────────────────────────────────
@@ -77,6 +47,7 @@ function extractText(message) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function startBridge() {
+  const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = await import("baileys");
   const { version } = await fetchLatestWaWebVersion({});
   logger.info({ version }, "Using WA Web version");
 
@@ -99,14 +70,12 @@ async function startBridge() {
 
     if (qr) {
       const QRCode = require("qrcode");
-      const { execFile } = require("child_process");
       const qrPath = path.join(__dirname, "qr.png");
       QRCode.toFile(qrPath, qr, { scale: 4, margin: 2 }, (err) => {
         if (err) {
           logger.error({ err: err.message }, "Failed to generate QR image");
         } else {
-          logger.info({ path: qrPath }, "QR code saved — opening in browser");
-          execFile("cmd", ["/c", "start", "", qrPath]);
+          logger.info({ path: qrPath }, "Open this QR image locally and scan it to pair WhatsApp");
         }
       });
     }
@@ -141,7 +110,7 @@ async function startBridge() {
 
       // Skip messages with no text content (media without caption) for v1
       if (!text && msgType !== "text") {
-        logger.debug({ type: msgType, from: msg.key.remoteJid }, "Skipping non-text message");
+        logger.debug({ type: msgType }, "Skipping non-text message");
         continue;
       }
 
@@ -175,16 +144,16 @@ async function startBridge() {
         message_text: text,
         message_type: msgType,
         is_from_me: msg.key.fromMe || false,
-        timestamp: new Date((msg.messageTimestamp || 0) * 1000).toISOString(),
+        timestamp: new Date(Number(msg.messageTimestamp || 0) * 1000).toISOString(),
       };
 
-      logger.info(
-        { chat: data.chat_name || data.chat_jid, sender: data.sender_name, type: msgType },
-        "New message"
-      );
+      logger.debug({ type: msgType }, "New message");
 
-      // Fire and forget — postMessage handles retries internally
-      postMessage(data);
+      try {
+        deliveryQueue.enqueue(data);
+      } catch (error) {
+        stopForDeliveryError(error);
+      }
     }
   });
 }
@@ -193,6 +162,7 @@ async function startBridge() {
 
 logger.info("Starting GG WhatsApp Bridge...");
 logger.info({ pythonUrl: PYTHON_URL }, "Will forward messages to Python");
+deliveryQueue.start(stopForDeliveryError);
 startBridge().catch(err => {
   logger.error({ err: err.message }, "Initial startup failed");
   process.exit(1);
@@ -201,9 +171,11 @@ startBridge().catch(err => {
 // Graceful shutdown
 process.on("SIGINT", () => {
   logger.info("Shutting down...");
+  deliveryQueue.stop();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
   logger.info("Shutting down...");
+  deliveryQueue.stop();
   process.exit(0);
 });

@@ -13,7 +13,7 @@ from utils import split_long_message
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+OWNER_CHAT_ID = 0  # Set by main() after checking the allowlist.
 
 # Pre-meeting alert state
 _alerted_events: set[str] = set()

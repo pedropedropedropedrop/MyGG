@@ -16,6 +16,7 @@ OAuth:
     `whoop_auth.py` and refreshed in-place by _refresh_token below.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import httpx
 
+from utils import write_secret_file
 from constants import (
     WHOOP_API_BASE,
     WHOOP_API_TIMEOUT_SECONDS,
@@ -39,6 +41,7 @@ from constants import (
 
 logger = logging.getLogger(__name__)
 
+_refresh_lock = asyncio.Lock()
 TOKEN_FILE = Path(__file__).parent.parent / ".whoop_token.json"
 
 # Whoop recovery color bands (from their app UX). Tuples are (lower-bound %, label).
@@ -113,7 +116,7 @@ def _load_token() -> dict | None:
 def _save_token(token: dict) -> None:
     """Persist the token dict back to disk."""
     assert "access_token" in token, "cannot persist token without access_token"
-    TOKEN_FILE.write_text(json.dumps(token, indent=2))
+    write_secret_file(TOKEN_FILE, json.dumps(token, indent=2))
 
 
 def _is_expired(token: dict) -> bool:
@@ -125,26 +128,34 @@ def _is_expired(token: dict) -> bool:
 async def _refresh_token(token: dict) -> dict:
     """Exchange refresh_token for a fresh access_token. Persists and returns the new dict."""
     refresh_token = token.get("refresh_token", "")
-    assert refresh_token, "no refresh_token available; re-run whoop_auth.py"
+    if not refresh_token:
+        raise WhoopNotConnectedError("Run python whoop_auth.py to reconnect WHOOP.")
     client_id = os.getenv("WHOOP_CLIENT_ID", "").strip()
     client_secret = os.getenv("WHOOP_CLIENT_SECRET", "").strip()
-    assert client_id and client_secret, "WHOOP_CLIENT_ID/SECRET missing in environment"
+    if not client_id or not client_secret:
+        raise WhoopNotConnectedError("Set WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET in .env.")
 
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": client_id,
         "client_secret": client_secret,
-        "scope": token.get("scope", ""),
+        "scope": "offline",
     }
     async with httpx.AsyncClient(timeout=WHOOP_API_TIMEOUT_SECONDS) as client:
         resp = await client.post(WHOOP_OAUTH_TOKEN_URL, data=payload)
-        resp.raise_for_status()
+        if resp.status_code in (400, 401):
+            raise WhoopNotConnectedError("WHOOP rejected the refresh. Check your client credentials "
+                                         "and run python whoop_auth.py to reconnect.")
+        if not resp.is_success:
+            raise RuntimeError(f"WHOOP token refresh failed (HTTP {resp.status_code}).")
         body = resp.json()
+        if not body.get("access_token") or not body.get("refresh_token"):
+            raise WhoopNotConnectedError("Incomplete WHOOP token response. Run python whoop_auth.py to reconnect.")
 
     new_token = {
         "access_token": body["access_token"],
-        "refresh_token": body.get("refresh_token", refresh_token),
+        "refresh_token": body["refresh_token"],
         "expires_at": time.time() + int(body.get("expires_in", 0)),
         "scope": body.get("scope", token.get("scope", "")),
         "token_type": body.get("token_type", "bearer"),
@@ -160,17 +171,21 @@ class WhoopNotConnectedError(RuntimeError):
     """Raised when no token cache is present — user needs to run whoop_auth.py."""
 
 
+async def _get_fresh_token(rejected_access_token: str | None = None) -> dict:
+    # WHOOP rotates the refresh token. Re-read it after the previous caller finishes.
+    async with _refresh_lock:
+        token = _load_token()
+        if token is None:
+            raise WhoopNotConnectedError("Run python whoop_auth.py to connect WHOOP.")
+        if _is_expired(token) or token["access_token"] == rejected_access_token:
+            return await _refresh_token(token)
+        return token
+
+
 async def _authed_request(method: str, path: str, params: dict | None = None) -> dict:
     """Call the Whoop API with bearer auth, refreshing once on 401."""
     assert path.startswith("/"), "path must start with '/'"
-    token = _load_token()
-    if token is None:
-        raise WhoopNotConnectedError(
-            "Whoop is not connected. Run `python whoop_auth.py` once to grant consent."
-        )
-    if _is_expired(token):
-        token = await _refresh_token(token)
-
+    token = await _get_fresh_token()
     url = f"{WHOOP_API_BASE}{path}"
     attempts = 0
     last_error = None
@@ -181,11 +196,11 @@ async def _authed_request(method: str, path: str, params: dict | None = None) ->
             resp = await client.request(method, url, params=params, headers=headers)
         if resp.status_code == 401 and attempts < WHOOP_REFRESH_RETRY_LIMIT:
             logger.info("Whoop 401 — refreshing token and retrying once")
-            token = await _refresh_token(token)
+            token = await _get_fresh_token(rejected_access_token=token["access_token"])
             attempts += 1
             continue
         if resp.status_code >= 400:
-            last_error = f"Whoop API {resp.status_code}: {resp.text[:200]}"
+            last_error = f"Whoop API error (HTTP {resp.status_code})."
             break
         return resp.json()
     raise RuntimeError(last_error or "Whoop API request failed after refresh retry")
@@ -560,7 +575,7 @@ async def execute_tool(name: str, input_data: dict) -> str:
         return str(exc)
     except httpx.HTTPStatusError as exc:
         logger.exception("Whoop HTTP error")
-        return f"Whoop API error {exc.response.status_code}: {exc.response.text[:200]}"
+        return f"Whoop API error (HTTP {exc.response.status_code})."
     except httpx.RequestError as exc:
         logger.exception("Whoop network error")
         return f"Network error talking to Whoop: {exc}"

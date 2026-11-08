@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
+import llm
 import tools
 from constants import CLAUDE_MAX_TOKENS, MAX_TRANSCRIPT_CHARS, CLAUDE_API_TIMEOUT_SECONDS, CLAUDE_CLARIFY_TIMEOUT_SECONDS
 
@@ -17,47 +18,11 @@ logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
 MEETINGS_DIR = Path(__file__).parent.parent / "meeting_transcripts"
-MEETINGS_DIR.mkdir(exist_ok=True)
-
-_client = anthropic.AsyncAnthropic()
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-
 
 # ── Database ─────────────────────────────────────────────────────────────────
 
-def _init_meetings_table():
-    conn = tools.get_db()
-    try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS meeting_notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT,
-                date TEXT NOT NULL,
-                duration_seconds REAL,
-                language TEXT,
-                calendar_event_id TEXT,
-                calendar_account TEXT,
-                transcript_path TEXT,
-                summary TEXT,
-                decisions TEXT,
-                action_items TEXT,
-                participants TEXT,
-                clarifications TEXT,
-                status TEXT DEFAULT 'processing',
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-        """)
-        conn.commit()
-    finally:
-        conn.close()
-
-try:
-    _init_meetings_table()
-except Exception:
-    logger.exception("meetings: failed to initialize DB table")
-
-
 def _save_transcript(meeting_id: int, transcript: str) -> str:
+    MEETINGS_DIR.mkdir(exist_ok=True)
     path = MEETINGS_DIR / f"meeting_{meeting_id}.txt"
     path.write_text(transcript, encoding="utf-8")
     return str(path)
@@ -121,12 +86,8 @@ def _fmt_time(seconds: float) -> str:
 
 
 async def _transcribe_audio(file_path: str) -> tuple[str, float]:
-    """Transcribe using the proven tools.transcribe_audio path.
-
-    Note: tools.transcribe_audio has its own 60s timeout — we use a longer
-    outer timeout here to allow for large files (the inner timeout is per-chunk).
-    """
-    transcript = await tools.transcribe_audio(file_path)
+    """Allow longer recordings up to ten minutes of processing time."""
+    transcript = await tools.transcribe_audio(file_path, timeout=600)
     # Duration is logged by faster-whisper but not returned — estimate from transcript length
     # ~150 words per minute of speech, ~5 chars per word
     estimated_duration = len(transcript) / (150 * 5 / 60)  # rough estimate in seconds
@@ -216,23 +177,24 @@ async def _process_with_claude(transcript: str, context: dict) -> dict:
     for attempt in range(3):
         try:
             response = await asyncio.wait_for(
-                _client.messages.create(
-                    model=MODEL,
+                llm.create(
                     max_tokens=CLAUDE_MAX_TOKENS,
                     system=prompt,
                     messages=[{"role": "user", "content": f"## Meeting Transcript\n\n{transcript}"}],
                 ),
-                timeout=CLAUDE_API_TIMEOUT_SECONDS,  # 2 min — meetings are large prompts
+                timeout=None if llm.LOCAL else CLAUDE_API_TIMEOUT_SECONDS,
             )
-            text = response.content[0].text.strip()
+            text = llm.text(response)
+            if not text:
+                raise ValueError("The model returned an empty meeting summary")
             # LOGIC-8 FIX: robust markdown fence stripping
             import re
             text = re.sub(r'^```[a-z]*\n', '', text)
             text = re.sub(r'\n?```$', '', text)
             text = text.strip()
             result = json.loads(text)
-            assert isinstance(result, dict), f"Claude returned non-dict: {type(result)}"
-            assert "summary" in result, f"Claude response missing 'summary' key: {list(result.keys())}"
+            if not isinstance(result, dict) or not isinstance(result.get("summary"), str):
+                raise ValueError("The model returned invalid meeting notes")
             return result
         except anthropic.APIStatusError as e:
             if e.status_code in (429, 529) and attempt < 2:
@@ -260,33 +222,6 @@ async def _process_with_claude(transcript: str, context: dict) -> dict:
 
 TOOL_DEFINITIONS = [
     {
-        "name": "process_meeting",
-        "description": (
-            "Process a meeting audio recording. Transcribes the audio, cross-references "
-            "with calendar/email/memory, extracts summary, decisions, action items, and "
-            "identifies participants. Use this when the user sends an audio file and says "
-            "it's a meeting recording, or when the caption mentions 'meeting'."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the audio file on disk",
-                },
-                "meeting_date": {
-                    "type": "string",
-                    "description": "Date of the meeting in YYYY-MM-DD format. Defaults to today.",
-                },
-                "context_hint": {
-                    "type": "string",
-                    "description": "Optional context from the user about the meeting (who it was with, what project, etc.)",
-                },
-            },
-            "required": ["file_path"],
-        },
-    },
-    {
         "name": "meeting_clarify",
         "description": (
             "Provide answers to clarifying questions from a meeting that was just processed. "
@@ -297,7 +232,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "meeting_id": {
                     "type": "integer",
-                    "description": "The meeting ID from the process_meeting result",
+                    "description": "The meeting ID from the uploaded recording",
                 },
                 "answers": {
                     "type": "string",
@@ -332,8 +267,6 @@ TOOL_DEFINITIONS = [
 
 async def execute_tool(name: str, input_data: dict) -> str:
     match name:
-        case "process_meeting":
-            return await _handle_process_meeting(input_data)
         case "meeting_clarify":
             return await _handle_clarify(input_data)
         case "get_meeting_notes":
@@ -391,7 +324,7 @@ async def _handle_process_meeting(input_data: dict) -> str:
         result = await _process_with_claude(transcript, context)
     except Exception as e:
         _update_meeting(meeting_id, status="failed")
-        return f"Claude processing failed: {e}"
+        return f"Meeting analysis failed: {e}"
 
     _update_meeting(
         meeting_id,
@@ -513,13 +446,13 @@ Update the meeting information based on the user's answers. Return JSON with:
 
     try:
         response = await asyncio.wait_for(
-            _client.messages.create(
-                model=MODEL, max_tokens=2048,
+            llm.create(
+                max_tokens=2048,
                 messages=[{"role": "user", "content": refine_prompt}],
             ),
-            timeout=CLAUDE_CLARIFY_TIMEOUT_SECONDS,  # 1 min for clarification refinement
+            timeout=None if llm.LOCAL else CLAUDE_CLARIFY_TIMEOUT_SECONDS,
         )
-        updates = _parse_clarification_response(response.content[0].text.strip())
+        updates = _parse_clarification_response(llm.text(response))
     except Exception as e:
         return f"Failed to process clarifications: {e}"
 
@@ -539,7 +472,7 @@ Update the meeting information based on the user's answers. Return JSON with:
         try:
             await tools.remember(mem, tags=["meeting", "person"])
         except Exception:
-            logger.warning(f"Failed to store meeting memory: {mem[:80]}", exc_info=True)
+            logger.warning("Failed to store a meeting memory", exc_info=True)
 
     if remaining:
         lines = ["Thanks! I've updated the notes. A few more questions:"]
@@ -548,7 +481,7 @@ Update the meeting information based on the user's answers. Return JSON with:
         lines.append(f"\n(Meeting ID: {meeting_id})")
         return "\n".join(lines)
 
-    return f"Meeting #{meeting_id} notes finalized. All clarifications resolved - I've remembered the people and context for next time."
+    return f"Meeting #{meeting_id} notes finalized. All clarifications resolved."
 
 
 async def _handle_get_notes(input_data: dict) -> str:

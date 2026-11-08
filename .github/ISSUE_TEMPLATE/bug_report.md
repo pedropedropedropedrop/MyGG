@@ -22,7 +22,7 @@ What you thought would happen.
 
 ## Actual behavior
 
-What actually happened. Paste any error messages or relevant log lines.
+Include the relevant error after removing keys, tokens, names, chat IDs and message content.
 
 ```
 <paste logs here>
@@ -33,9 +33,9 @@ What actually happened. Paste any error messages or relevant log lines.
 - OS: (Windows 11 / macOS 14 / Ubuntu 24.04)
 - Python version: (`python --version`)
 - MyGG commit: (`git rev-parse --short HEAD`)
-- Anthropic model in use: (sonnet / opus)
+- Model in use: (Claude or local Ollama model name)
 - Optional features enabled: (WHOOP / WhatsApp / audio)
 
 ## Additional context
 
-Anything else that helps diagnose the problem — screenshots, related issues, recent changes to your `.env`.
+Include related issues or the names of settings you changed. Keep credentials, QR codes and personal screenshots private.

@@ -6,12 +6,16 @@ import sqlite3
 import asyncio
 import threading
 import logging
+import re
+from importlib.util import find_spec
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from utils import write_secret_file
 
 from constants import (
     EMAIL_BODY_MAX_CHARS,
+    EMAIL_DRAFT_MAX_CHARS,
     MEMORY_RECALL_TIMEOUT_SECONDS,
     TRANSCRIBE_TIMEOUT_SECONDS,
 )
@@ -27,20 +31,22 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
 ]
 
-# Multi-account Google configuration.
-# To add a second account:
-#   1. Add another entry below, e.g.:
-#         "work": {
-#             "token_path": Path(__file__).parent / "token_work.json",
-#             "label": os.getenv("GOOGLE_ACCOUNT_WORK_LABEL", "Work account"),
-#         },
-#   2. Run `python setup_calendar.py work` to authorize and write the token file.
 GOOGLE_ACCOUNTS = {
     "personal": {
         "token_path": Path(__file__).parent / "token.json",
         "label": os.getenv("GOOGLE_ACCOUNT_LABEL", "Personal Google account"),
     },
 }
+for account_name in os.getenv("GOOGLE_EXTRA_ACCOUNTS", "").split(","):
+    account_name = account_name.strip()
+    if not account_name or account_name in GOOGLE_ACCOUNTS:
+        continue
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", account_name):
+        raise ValueError("GOOGLE_EXTRA_ACCOUNTS needs lowercase names such as work,club.")
+    GOOGLE_ACCOUNTS[account_name] = {
+        "token_path": Path(__file__).with_name(f"token_{account_name}.json"),
+        "label": os.getenv(f"GOOGLE_ACCOUNT_{account_name.upper()}_LABEL", account_name),
+    }
 
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -90,6 +96,23 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_wa_timestamp ON whatsapp_messages(timestamp);
             CREATE INDEX IF NOT EXISTS idx_wa_chat ON whatsapp_messages(chat_jid);
             CREATE INDEX IF NOT EXISTS idx_wa_summarized ON whatsapp_messages(summarized);
+            CREATE TABLE IF NOT EXISTS meeting_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                date TEXT NOT NULL,
+                duration_seconds REAL,
+                language TEXT,
+                calendar_event_id TEXT,
+                calendar_account TEXT,
+                transcript_path TEXT,
+                summary TEXT,
+                decisions TEXT,
+                action_items TEXT,
+                participants TEXT,
+                clarifications TEXT,
+                status TEXT DEFAULT 'processing',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
         """)
         conn.commit()
     finally:
@@ -102,6 +125,12 @@ _memory_client = None
 _memory_lock = threading.Lock()
 
 
+def memory_enabled() -> bool:
+    # Older installations bundled mem0 and have no switch in their .env.
+    value = os.getenv("ENABLE_MEMORY")
+    return find_spec("mem0") is not None if value is None else value.lower() == "true"
+
+
 def _get_memory():
     global _memory_client
     if _memory_client is not None:
@@ -109,6 +138,7 @@ def _get_memory():
     with _memory_lock:
         if _memory_client is not None:
             return _memory_client
+        os.environ["MEM0_TELEMETRY"] = "False"
         from mem0 import Memory
         config = {
             "llm": {
@@ -145,7 +175,9 @@ def _memory_user_id() -> str:
     return os.getenv("USER_NAME", "user").strip().lower() or "user"
 
 
-async def remember(text: str, tags: list[str] | None = None) -> str:
+async def remember(text: str, tags: list[str] | None = None, *, infer: bool = True) -> str:
+    if not memory_enabled():
+        return "Long-term memory is turned off. See the memory setup in ONBOARDING.md."
     metadata = {}
     if tags:
         metadata["tags"] = ",".join(tags)
@@ -153,13 +185,21 @@ async def remember(text: str, tags: list[str] | None = None) -> str:
 
     def _add():
         m = _get_memory()
-        m.add(text, user_id=_memory_user_id(), metadata=metadata)
+        return m.add(text, user_id=_memory_user_id(), metadata=metadata, infer=infer)
 
-    await asyncio.to_thread(_add)
-    return f"Stored: {text}"
+    result = await asyncio.to_thread(_add)
+    rows = result.get("results", []) if isinstance(result, dict) else result
+    if any(isinstance(row, dict) and row.get("id") and row.get("event") in {"ADD", "UPDATE"}
+           for row in (rows or [])):
+        return f"Stored: {text}"
+    if infer:
+        return "No new long-term memory was recorded."
+    raise RuntimeError("The memory store did not confirm saving the summary.")
 
 
 async def recall(query: str) -> str:
+    if not memory_enabled():
+        return "No relevant memories found."
     def _search():
         m = _get_memory()
         return m.search(query, user_id=_memory_user_id(), limit=10)
@@ -188,7 +228,7 @@ def _get_google_creds(account: str):
     creds = Credentials.from_authorized_user_file(str(acct["token_path"]), GOOGLE_SCOPES)
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        acct["token_path"].write_text(creds.to_json())
+        write_secret_file(acct["token_path"], creds.to_json())
         # Invalidate cached services — they hold the old credentials
         _services.pop(account, None)
     return creds
@@ -339,9 +379,8 @@ async def create_event(
         if attendees:
             event["attendees"] = [{"email": e} for e in attendees]
 
-        created = (
-            service.events().insert(calendarId="primary", body=event).execute()
-        )
+        service.events().insert(calendarId="primary", body=event,
+                                sendUpdates="all" if attendees else "none").execute()
         label = GOOGLE_ACCOUNTS.get(account, {}).get("label", account)
         invited = f" (invited: {', '.join(attendees)})" if attendees else ""
         return f"Event created: {title} at {start_dt.strftime('%a %b %d %H:%M')} [{label}]{invited}"
@@ -510,81 +549,92 @@ async def read_email(email_id: str) -> str:
     return await asyncio.to_thread(_read)
 
 
-async def send_email(to: str, subject: str, body: str, account: str = "personal") -> str:
+def _email_header(value: str) -> str:
+    if not isinstance(value, str) or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("Invalid email header. Nothing sent.")
+    return value
+
+
+def _email_address(value: str) -> str:
+    import re
+    from email import policy
+
+    header = policy.default.header_factory("To", _email_header(value))
+    if header.defects or len(header.addresses) != 1:
+        raise ValueError("One valid email address is required. Nothing sent.")
+    address = header.addresses[0]
+    labels = address.domain.split(".")
+    if (not address.username or len(labels) < 2 or
+            any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) for label in labels)):
+        raise ValueError("A valid email address is required. Nothing sent.")
+    return address.addr_spec
+
+
+def _prepare_email(to: str, subject: str, body: str, account: str = "personal", email_id: str | None = None) -> dict:
+    """Read-only preparation: freeze every delivery field before showing approval."""
     import base64
     from email.mime.text import MIMEText
 
-    def _send():
-        service = _get_gmail_service(account)
-        if not service:
-            return f"Gmail not configured for '{account}'."
-
-        message = MIMEText(body)
-        message["to"] = to
-        message["subject"] = subject
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
-        sent = (
-            service.users()
-            .messages()
-            .send(userId="me", body={"raw": raw})
-            .execute()
-        )
-        label = GOOGLE_ACCOUNTS.get(account, {}).get("label", account)
-        return f"Email sent to {to} from {label} (Subject: {subject})"
-
-    return await asyncio.to_thread(_send)
-
-
-async def reply_email(email_id: str, body: str) -> str:
-    import base64
-    from email.mime.text import MIMEText
-
-    def _reply():
-        acct, msg_id = _parse_email_id(email_id)
-        service = _get_gmail_service(acct)
-        if not service:
-            return f"Gmail not configured for '{acct}'."
-
-        # Get original message for headers
-        orig = (
-            service.users()
-            .messages()
-            .get(userId="me", id=msg_id, format="metadata",
-                 metadataHeaders=["From", "Subject", "Message-ID"])
-            .execute()
-        )
-        headers = _parse_email_headers(orig.get("payload", {}).get("headers", []))
-        thread_id = orig.get("threadId")
-
-        # Get Message-ID for In-Reply-To
-        orig_msg_id = ""
-        for h in orig.get("payload", {}).get("headers", []):
-            if h["name"].lower() == "message-id":
-                orig_msg_id = h["value"]
-
+    if not isinstance(body, str) or not body.strip() or len(body) > EMAIL_DRAFT_MAX_CHARS:
+        raise ValueError(f"An email body of 1–{EMAIL_DRAFT_MAX_CHARS} characters is required. Nothing sent.")
+    if email_id is not None:
+        if not isinstance(email_id, str) or not email_id.strip():
+            raise ValueError("An email ID is required. Nothing sent.")
+        if ":" in email_id:
+            account, email_id = email_id.split(":", 1)
+        if not email_id or any(char.isspace() for char in email_id):
+            raise ValueError("Invalid email ID. Nothing sent.")
+    if not isinstance(account, str) or account not in GOOGLE_ACCOUNTS:
+        raise ValueError("Unknown email account. Nothing sent.")
+    service = _get_gmail_service(account)
+    if not service:
+        raise ValueError(f"Gmail not configured for '{account}'. Nothing sent.")
+    thread_id, in_reply_to, references = "", "", ""
+    if email_id is not None:
+        orig = service.users().messages().get(userId="me", id=email_id, format="metadata",
+            metadataHeaders=["From", "Reply-To", "Subject", "Message-ID", "References"]).execute()
+        headers = {header["name"].lower(): header["value"] for header in orig.get("payload", {}).get("headers", [])}
+        to = headers.get("reply-to") or headers.get("from", "")
+        thread_id = _email_header(orig.get("threadId", ""))
+        in_reply_to = _email_header(headers.get("message-id", ""))
+        if not thread_id or not in_reply_to:
+            raise ValueError("Reply thread or Message-ID missing. Nothing sent.")
+        references = _email_header(headers.get("references", ""))
+        references = f"{references} {in_reply_to}".strip()
         subject = headers.get("subject", "")
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
+    recipient = _email_address(to)
+    subject = _email_header(subject)
+    from_address = _email_address(service.users().getProfile(userId="me").execute().get("emailAddress", ""))
+    message = MIMEText(body, _charset="utf-8")
+    message["From"], message["To"], message["Subject"] = from_address, recipient, subject
+    if in_reply_to:
+        message["In-Reply-To"], message["References"] = in_reply_to, references
+    return {"account": account, "from_address": from_address, "recipient": recipient,
+            "subject": subject, "text": body, "thread_id": thread_id,
+            "raw": base64.urlsafe_b64encode(message.as_bytes()).decode()}
 
-        message = MIMEText(body)
-        message["to"] = headers.get("from", "")
-        message["subject"] = subject
-        if orig_msg_id:
-            message["In-Reply-To"] = orig_msg_id
-            message["References"] = orig_msg_id
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
-        sent = (
-            service.users()
-            .messages()
-            .send(userId="me", body={"raw": raw, "threadId": thread_id})
-            .execute()
-        )
-        label = GOOGLE_ACCOUNTS.get(acct, {}).get("label", acct)
-        return f"Reply sent from {label} to {headers.get('from', '?')} (Subject: {subject})"
-
-    return await asyncio.to_thread(_reply)
+async def _deliver_email(draft: dict) -> str:
+    """Only the trusted approval callback supplies a consumed, frozen draft."""
+    def deliver():
+        if draft["account"] not in GOOGLE_ACCOUNTS:
+            raise ValueError("Unknown email account")
+        service = _get_gmail_service(draft["account"])
+        if not service:
+            raise RuntimeError("Gmail account unavailable")
+        sender = service.users().getProfile(userId="me").execute().get("emailAddress", "")
+        if sender != draft["from_address"]:
+            raise RuntimeError("Gmail account changed since approval was prepared")
+        payload = {"raw": draft["raw"]}
+        if draft["thread_id"]:
+            payload["threadId"] = draft["thread_id"]
+        sent = service.users().messages().send(userId="me", body=payload).execute()
+        if not isinstance(sent, dict) or not sent.get("id"):
+            raise RuntimeError("Gmail returned no delivery receipt")
+        return f"Email sent from {draft['from_address']} ({draft['account']}) to {draft['recipient']} (Gmail receipt {sent['id']})"
+    return await asyncio.to_thread(deliver)
 
 
 # ── Todos ────────────────────────────────────────────────────────────────────
@@ -804,11 +854,13 @@ async def set_reminder(text: str, when: str, chat_id: int) -> str:
     def _set():
         # Validate date format before inserting
         dt = datetime.fromisoformat(when)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
         conn = get_db()
         try:
             conn.execute(
                 "INSERT INTO reminders (text, due_at, chat_id) VALUES (?, ?, ?)",
-                (text, when, chat_id),
+                (text, dt.isoformat(), chat_id),
             )
             conn.commit()
         finally:
@@ -818,41 +870,50 @@ async def set_reminder(text: str, when: str, chat_id: int) -> str:
     return await asyncio.to_thread(_set)
 
 
-async def check_due_reminders() -> list[tuple[int, str]]:
-    """Returns list of (chat_id, text) for due reminders."""
+async def check_due_reminders() -> list[tuple[int, int, str]]:
+    """Read pending deliveries, including older reminders stored in local time."""
 
     def _check():
         conn = get_db()
         try:
-            now = datetime.now(TZ).isoformat()
             rows = conn.execute(
-                "SELECT id, chat_id, text FROM reminders WHERE notified = 0 AND due_at <= ?",
-                (now,),
+                "SELECT id, chat_id, text, due_at FROM reminders WHERE notified = 0"
             ).fetchall()
-            if rows:
-                ids = [r["id"] for r in rows]
-                placeholders = ",".join("?" * len(ids))
-                conn.execute(
-                    f"UPDATE reminders SET notified = 1 WHERE id IN ({placeholders})",
-                    ids,
-                )
-                conn.commit()
+            due = []
+            now = datetime.now(TZ)
+            for row in rows:
+                when = datetime.fromisoformat(row["due_at"])
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=TZ)
+                if when.timestamp() <= now.timestamp():
+                    due.append((row["id"], row["chat_id"], row["text"]))
+            return due
         finally:
             conn.close()
-        return [(r["chat_id"], f"Reminder: {r['text']}") for r in rows]
 
     return await asyncio.to_thread(_check)
+
+
+async def finish_reminder(reminder_id: int) -> None:
+    def _finish():
+        conn = get_db()
+        try:
+            conn.execute("UPDATE reminders SET notified = 1 WHERE id = ?", (reminder_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    await asyncio.to_thread(_finish)
 
 
 # ── Audio ──────────────────────────────────────────────────────────────────
 
 
-async def transcribe_audio(file_path: str) -> str:
+async def transcribe_audio(file_path: str, timeout: int = TRANSCRIBE_TIMEOUT_SECONDS) -> str:
     """Transcribe audio file to text using faster-whisper."""
     from audio import transcriber
     return await asyncio.wait_for(
         asyncio.to_thread(transcriber.transcribe, file_path),
-        timeout=TRANSCRIBE_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
 
 

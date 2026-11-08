@@ -11,17 +11,13 @@ import tools
 
 logger = logging.getLogger(__name__)
 
-BRIDGE_SECRET = os.getenv("WHATSAPP_BRIDGE_SECRET", "")
+BRIDGE_SECRET = os.getenv("WHATSAPP_BRIDGE_SECRET", "").strip()
 BRIDGE_PORT = int(os.getenv("WHATSAPP_BRIDGE_PORT", "8787"))
-
-if not BRIDGE_SECRET:
-    logger.warning("WHATSAPP_BRIDGE_SECRET not set — WhatsApp bridge auth is DISABLED")
-
 
 def _check_auth(request: web.Request) -> bool:
     """Validate the bridge's auth token (timing-safe)."""
     if not BRIDGE_SECRET:
-        return True  # no secret configured = skip auth (dev only)
+        return False
     auth = request.headers.get("Authorization", "")
     expected = f"Bearer {BRIDGE_SECRET}"
     return hmac.compare_digest(auth.encode(), expected.encode())
@@ -34,8 +30,11 @@ async def handle_incoming(request: web.Request) -> web.Response:
 
     try:
         data = await request.json()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return web.Response(status=400, text="Invalid JSON")
+
+    if not isinstance(data, dict):
+        return web.Response(status=400, text="Expected a JSON object")
 
     # Validate required fields
     required = ["chat_jid", "sender_jid", "timestamp", "whatsapp_message_id"]
@@ -84,6 +83,9 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def start_server():
     """Start the aiohttp server as a background task."""
+    if not BRIDGE_SECRET:
+        logger.info("WhatsApp is disabled until WHATSAPP_BRIDGE_SECRET is set")
+        return
     app = web.Application()
     app.router.add_post("/whatsapp/incoming", handle_incoming)
     app.router.add_get("/whatsapp/health", handle_health)

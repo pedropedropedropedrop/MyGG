@@ -17,7 +17,13 @@ MyGG is a personal-scale project. The roadmap reflects what one person can reali
 - [x] Configurable `personality.md`
 - [x] Windows service install
 
-## Near-term — `v0.2.x`
+## Available since the initial release
+
+- [x] Local chat model via Ollama, including local meeting and WhatsApp summaries.
+- [x] Text-only setup with separate voice and memory packages.
+- [x] Telegram approval for outgoing email and calendar invitations.
+
+## Near-term ideas
 
 - [ ] One-shot install scripts for macOS (`install.sh`) and Linux (`install.sh`)
 - [ ] Pluggable LLM provider — swap Anthropic for an OpenAI-compatible endpoint
@@ -25,14 +31,13 @@ MyGG is a personal-scale project. The roadmap reflects what one person can reali
 - [ ] More example modules (Google Tasks, Apple Reminders bridge, Spotify, Notion)
 - [ ] First-run wizard that walks the user through `.env` and OAuth interactively
 - [ ] Optional web dashboard for memory inspection and conversation history
-- [ ] Test coverage above 50% (currently minimal — module discovery only)
+- [ ] Test coverage above 50%
 
 ## Mid-term — `v0.3.x`
 
 - [ ] Mobile companion (iOS / Android) using Telegram as transport, but with native widgets
 - [ ] Multi-user mode (per-user mem0 namespacing, per-user OAuth tokens, per-user personality)
 - [ ] Plugin marketplace pattern — `pip install mygg-spotify`-style external modules
-- [ ] Local-only mode — replace Anthropic with a local model via Ollama for full privacy
 
 ## Long-term — `v1.0.0`
 

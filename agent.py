@@ -3,12 +3,15 @@
 import asyncio
 import os
 import logging
+from functools import partial
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anthropic
 
+import audio
+import llm
 import tools
 import modules
 import json as _json
@@ -18,9 +21,8 @@ logger = logging.getLogger(__name__)
 
 USER_NAME = os.getenv("USER_NAME", "user")
 TZ = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-MODEL_OPUS = os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-4-6")
-client = anthropic.AsyncAnthropic()
+MODEL = llm.MODEL
+MODEL_OPUS = MODEL if llm.LOCAL else os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-4-6")
 
 # Path to the optional personality file (next to this script).
 PERSONALITY_FILE = Path(__file__).parent / "personality.md"
@@ -67,22 +69,20 @@ def _trim_history(messages: list):
     Always ensures the first message after trim is a 'user' role (not a tool_result
     or assistant message mid-turn) to avoid Anthropic API 400 errors.
     """
-    if len(messages) <= MAX_HISTORY:
-        return
-    messages[:] = messages[-MAX_HISTORY:]
-    # Ensure we start with a user message (not an assistant or tool_result)
-    while messages and messages[0].get("role") != "user":
-        messages.pop(0)
-    # Remove any orphaned tool_result messages (and subsequent assistant turns)
-    # that reference tool_use_ids no longer in history. Loop handles multiple layers.
-    while messages:
-        content = messages[0].get("content")
-        if isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
-            messages.pop(0)
-            while messages and messages[0].get("role") != "user":
-                messages.pop(0)
-        else:
+    # Ollama has no server-side compaction. Drop complete oldest turns and
+    # always preserve the current user plus every tool call/result in that turn.
+    while (len(messages) > MAX_HISTORY or
+           (llm.LOCAL and sum(len(str(m["content"])) for m in messages) > 24000)):
+        for i, message in enumerate(messages[1:], start=1):
+            if message["role"] != "user":
+                continue
+            content = message["content"]
+            if isinstance(content, list) and any(b.get("type") == "tool_result" for b in content):
+                continue
+            del messages[:i]
             break
+        else:
+            return
 
 
 TOOL_DEFINITIONS = [
@@ -148,7 +148,7 @@ TOOL_DEFINITIONS = [
         "name": "create_event",
         "description": (
             f"Create a Google Calendar event. When {USER_NAME} mentions someone to add and you have their "
-            "email in memory or context, pass it via attendees. Defaults to the 'personal' account."
+            "email in memory or context, pass it via attendees. Events with guests require review in Telegram."
         ),
         "input_schema": {
             "type": "object",
@@ -287,7 +287,7 @@ TOOL_DEFINITIONS = [
     {
         "name": "send_email",
         "description": (
-            f"Send a new email. When {USER_NAME} explicitly asks you to send an email, that IS the confirmation — just send it. "
+            "Prepare a new email for the user to review in Telegram. "
             "Compose subject and body from conversation context. Defaults to the 'personal' account."
         ),
         "input_schema": {
@@ -307,7 +307,7 @@ TOOL_DEFINITIONS = [
     {
         "name": "reply_email",
         "description": (
-            f"Reply to an existing email. When {USER_NAME} asks you to reply, that IS the confirmation — compose and send. "
+            "Prepare a reply for the user to review in Telegram. "
             "Auto-detects account from email ID."
         ),
         "input_schema": {
@@ -406,7 +406,14 @@ TOOL_DEFINITIONS = [
 
 def _get_all_tool_definitions() -> list[dict]:
     """Core tools + module tools."""
-    return TOOL_DEFINITIONS + modules.get_tool_definitions()
+    definitions = TOOL_DEFINITIONS + modules.get_tool_definitions()
+    if not tools.memory_enabled():
+        definitions = [t for t in definitions if t["name"] not in {"recall", "remember"}]
+    if llm.LOCAL or not audio.can_synthesize():
+        definitions = [t for t in definitions if t["name"] != "send_audio"]
+    if llm.LOCAL:
+        definitions = [t for t in definitions if "type" not in t]
+    return definitions
 
 
 def _prompt_header(now: datetime) -> str:
@@ -444,13 +451,16 @@ def _load_personality() -> str:
 
 def _prompt_behavior_rules() -> str:
     """Behavioral rules (proactive memory, tools usage, etc.)."""
+    memory_rule = ("Use remember for important decisions, ideas and preferences."
+                   if tools.memory_enabled() else "Long-term memory is disabled.")
+    hosted_tools = ("Answer using the available local tools. Web browsing and code execution are unavailable."
+                    if llm.LOCAL else "Use web search, web fetch and code execution when appropriate.")
     return f"""
 ## Behavior
 - Be concise. No fluff. Lead with the answer or action.
-- PROACTIVELY use the remember tool. When {USER_NAME} shares decisions, ideas, people, preferences, deadlines, project updates — store them immediately.
+- {memory_rule}
 - Use tools actively. Don't talk about doing things — DO them.
-- You have built-in web search and web fetch — use them freely when {USER_NAME} asks about current info, shares URLs, or you need to look something up.
-- You have code execution — use it for calculations, data analysis, charts, or any task that benefits from running real code rather than estimating.
+- {hosted_tools}
 - When asked for a briefing: show calendar, pending todos, recent reminders, and project status from memory.
 - You can call multiple tools in one turn when needed.
 - Only ask clarifying questions when the answer is TRULY unknowable from the conversation. If {USER_NAME} gave you the info earlier in the chat, USE IT — don't re-ask.
@@ -467,19 +477,18 @@ When {USER_NAME} says they are in a city ("I'm in Miami", "I'm traveling to NYC"
 
 ## Meeting Notes
 When {USER_NAME} sends an audio file (via document upload or long voice note), it may be a meeting recording.
-If the file path is provided and it looks like a meeting recording, use the process_meeting tool with the file path.
 After processing, present the notes and ask the clarifying questions.
 When {USER_NAME} answers clarification questions, use meeting_clarify with their answers.
-You can retrieve past meeting notes with get_meeting_notes.
-Meetings can be in any language the transcriber supports — it auto-detects.
-IMPORTANT: process_meeting can take 1-2 minutes. Before calling it, tell {USER_NAME} you're starting (e.g. "Processing your meeting recording now — transcribing and analyzing. This may take a minute or two.")."""
+You can retrieve past meeting notes with get_meeting_notes."""
 
 
 def _prompt_communication_rules() -> str:
     """Communication style rules."""
+    voice = ("You can send voice replies with send_audio. Always include the text as well."
+             if not llm.LOCAL and audio.can_synthesize() else "Reply in text. Voice synthesis is unavailable.")
     return f"""
 ## Voice
-You can send voice messages using the send_audio tool. Use it when it feels natural — like when {USER_NAME} sends a voice note and a voice reply fits, when your response is long and better as audio, or when they ask for it. When you use send_audio, still include your text response as usual — the audio is a bonus, not a replacement. Write the audio text conversationally — no markdown, no bullets, just natural speech.
+{voice}
 
 ## Communication
 ALWAYS acknowledge what you're doing. If you're processing something that takes time, tell {USER_NAME} immediately.
@@ -506,7 +515,7 @@ def _build_system_prompt(memory_context: str | None = None) -> str:
     return prompt
 
 
-async def _execute_tool(name: str, input_data: dict, chat_id: int) -> str | dict:
+async def _execute_tool(name: str, input_data: dict, chat_id: int, show_draft=None) -> str | dict:
     """Dispatch a tool call to the right implementation."""
     assert isinstance(name, str) and name, f"Tool name must be non-empty string, got: {name!r}"
     try:
@@ -521,14 +530,21 @@ async def _execute_tool(name: str, input_data: dict, chat_id: int) -> str | dict
                     input_data.get("account"),
                 )
             case "create_event":
-                return await tools.create_event(
-                    input_data["title"],
-                    input_data["start"],
-                    input_data.get("end"),
-                    input_data.get("description"),
-                    input_data.get("account", "personal"),
-                    input_data.get("attendees"),
-                )
+                attendees = input_data.get("attendees")
+                if attendees:
+                    if show_draft is None:
+                        return "Calendar invitations require user approval in a private Telegram chat."
+                    attendees = [tools._email_address(address) for address in attendees]
+                create = partial(tools.create_event, input_data["title"], input_data["start"],
+                                 input_data.get("end"), input_data.get("description"),
+                                 input_data.get("account", "personal"), attendees)
+                if attendees:
+                    preview = (f"Calendar invitation\nAccount: {input_data.get('account', 'personal')}\n"
+                               f"Guests: {', '.join(attendees)}\nTitle: {input_data['title']}\n"
+                               f"Starts: {input_data['start']}\nEnds: {input_data.get('end') or 'one hour later'}\n\n"
+                               f"{input_data.get('description') or ''}")
+                    return await show_draft(preview, create)
+                return await create()
             case "add_todo":
                 return await tools.add_todo(
                     input_data["task"],
@@ -554,13 +570,18 @@ async def _execute_tool(name: str, input_data: dict, chat_id: int) -> str | dict
                 )
             case "read_email":
                 return await tools.read_email(input_data["email_id"])
-            case "send_email":
-                return await tools.send_email(
-                    input_data["to"], input_data["subject"], input_data["body"],
-                    input_data.get("account", "personal"),
-                )
-            case "reply_email":
-                return await tools.reply_email(input_data["email_id"], input_data["body"])
+            case "send_email" | "reply_email":
+                if show_draft is None:
+                    return "Email requires user approval in a private Telegram chat."
+                if name == "reply_email":
+                    prepare = partial(tools._prepare_email, "", "", input_data["body"], email_id=input_data["email_id"])
+                else:
+                    prepare = partial(tools._prepare_email, input_data["to"], input_data["subject"], input_data["body"],
+                                      input_data.get("account", "personal"))
+                draft = await asyncio.to_thread(prepare)
+                preview = (f"Email draft\nFrom: {draft['from_address']} ({draft['account']})\n"
+                           f"To: {draft['recipient']}\nSubject: {draft['subject']}\n\n{draft['text']}")
+                return await show_draft(preview, partial(tools._deliver_email, draft))
             case "set_reminder":
                 return await tools.set_reminder(
                     input_data["text"], input_data["when"], chat_id
@@ -577,6 +598,10 @@ async def _execute_tool(name: str, input_data: dict, chat_id: int) -> str | dict
                     input_data.get("hours_back", 24),
                 )
             case "send_audio":
+                if llm.LOCAL:
+                    return "Voice replies are disabled in local mode. Reply in text."
+                if not audio.can_synthesize():
+                    return audio.VOICE_SETUP
                 return await tools.generate_audio(input_data["text"])
             case _:
                 # Try module dispatch
@@ -589,24 +614,21 @@ async def _execute_tool(name: str, input_data: dict, chat_id: int) -> str | dict
         return f"Tool error ({name}): {e}"
 
 
-async def _call_claude_with_retry(selected_model: str, system: str, tool_defs: list[dict], messages: list[dict]) -> tuple[object | None, str | None]:
-    """Call Claude API with exponential backoff retry.
-    Returns (response, error_message). One of the two will be None.
-    Uses beta API with compaction, adaptive thinking, and prompt caching.
-    """
+async def _call_model_with_retry(selected_model: str, system: str, tool_defs: list[dict], messages: list[dict], container=None) -> tuple[object | None, str | None]:
+    """Return (response, error_message), retrying transient provider errors."""
     for attempt in range(4):
         try:
-            response = await client.beta.messages.create(
-                betas=["compact-2026-01-12"],
+            response = await llm.create(
                 model=selected_model,
                 max_tokens=CLAUDE_MAX_TOKENS,
-                thinking={"type": "adaptive"},
-                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                system=system,
                 tools=tool_defs,
                 messages=messages,
-                context_management={"edits": [{"type": "compact_20260112"}]},
+                container=container,
             )
-            logger.info(f"Claude API responded: stop_reason={response.stop_reason}, blocks={len(response.content)}, model={selected_model}")
+            if not response.content:
+                return None, "The model returned an empty reply. Please try again."
+            logger.info("Model responded: stop_reason=%s, model=%s", response.stop_reason, selected_model)
             return response, None
         except anthropic.APIStatusError as e:
             if e.status_code in (429, 529):
@@ -615,16 +637,16 @@ async def _call_claude_with_retry(selected_model: str, system: str, tool_defs: l
                     logger.warning(f"API {e.status_code} (attempt {attempt + 1}/4), retrying in {wait}s")
                     await asyncio.sleep(wait)
                 continue
-            logger.exception(f"Claude API call failed: {e}")
+            logger.exception("Model API call failed")
             return None, f"Sorry, I hit an API error: {e}"
         except Exception as e:
-            logger.exception(f"Claude API call failed: {e}")
+            logger.exception("Model API call failed")
             return None, f"Sorry, I hit an API error: {e}"
     # All retry attempts exhausted without break
     return None, "Sorry, the API is overloaded right now. Try again in a minute."
 
 
-async def handle_message(chat_id: int, user_content: str | list, force_opus: bool = False) -> tuple[str, list[str]]:
+async def handle_message(chat_id: int, user_content: str | list, force_opus: bool = False, show_draft=None) -> tuple[str, list[str]]:
     """Process a user message through the Claude agent loop.
 
     user_content can be a plain string or a list of content blocks
@@ -634,6 +656,10 @@ async def handle_message(chat_id: int, user_content: str | list, force_opus: boo
     """
     assert isinstance(chat_id, int) and chat_id != 0, f"Invalid chat_id: {chat_id}"
     assert isinstance(user_content, (str, list)), f"user_content must be str or list, got {type(user_content)}"
+    if llm.LOCAL and isinstance(user_content, list) and any(
+        b.get("type") in {"document", "image"} for b in user_content
+    ):
+        return "My local model handles text. Send the text from that file or image.", []
 
     # HANG-1 FIX: timeout on lock acquisition so messages don't queue forever
     lock = _get_chat_lock(chat_id)
@@ -642,14 +668,14 @@ async def handle_message(chat_id: int, user_content: str | list, force_opus: boo
     except asyncio.TimeoutError:
         return "I'm still working on something — give me a moment and try again.", []
     try:
-        result = await _handle_message_locked(chat_id, user_content, force_opus)
+        result = await _handle_message_locked(chat_id, user_content, force_opus, show_draft=show_draft)
         _evict_stale_conversations()
         return result
     finally:
         lock.release()
 
 
-async def _handle_message_locked(chat_id: int, user_content: str | list, force_opus: bool = False) -> tuple[str, list[str]]:
+async def _handle_message_locked(chat_id: int, user_content: str | list, force_opus: bool = False, show_draft=None) -> tuple[str, list[str]]:
     """Internal message handler — runs while holding the chat lock."""
 
     # Get or create conversation history
@@ -666,7 +692,7 @@ async def _handle_message_locked(chat_id: int, user_content: str | list, force_o
         logger.info("Recalling memories...")
         memory_context = await asyncio.wait_for(
             tools.recall(recall_query), timeout=MEMORY_RECALL_TIMEOUT_SECONDS
-        ) if recall_query else None
+        ) if recall_query and tools.memory_enabled() else None
         logger.info(f"Memory recall done (found={memory_context is not None})")
     except asyncio.TimeoutError:
         logger.warning(f"Memory recall timed out ({MEMORY_RECALL_TIMEOUT_SECONDS}s) — skipping")
@@ -708,14 +734,20 @@ async def _handle_message_locked(chat_id: int, user_content: str | list, force_o
 
     # Agent loop — keeps running until Claude responds without tool calls
     max_iterations = 25
+    container_id = None
     for iteration in range(max_iterations):
-        logger.info(f"Calling Claude API (iteration {iteration + 1}, model={selected_model}, msgs={len(messages)})")
-        response, err = await _call_claude_with_retry(selected_model, system, _get_all_tool_definitions(), messages)
+        logger.info("Calling model (iteration %s, model=%s, msgs=%s)", iteration + 1, selected_model, len(messages))
+        response, err = await _call_model_with_retry(selected_model, system, _get_all_tool_definitions(), messages, container_id)
         if err is not None:
             return err, audio_files
 
         # Serialize content blocks for history (preserves compaction blocks)
-        content = [block.model_dump() for block in response.content]
+        if getattr(response, "container", None):
+            container_id = response.container.id
+        content = [block.model_dump(exclude_none=True) for block in response.content
+                   if not llm.LOCAL or block.type in {"text", "tool_use"}]
+        if not content:
+            return "The model returned no answer. Please try again.", audio_files
         messages.append({"role": "assistant", "content": content})
 
         # Server-side tool pause — re-send to continue (no user message needed)
@@ -733,8 +765,8 @@ async def _handle_message_locked(chat_id: int, user_content: str | list, force_o
         # Execute all tool calls
         tool_results = []
         for tu in tool_uses:
-            logger.info(f"Tool call: {tu.name}({tu.input})")
-            result = await _execute_tool(tu.name, tu.input, chat_id)
+            logger.info("Tool call: %s", tu.name)
+            result = await _execute_tool(tu.name, tu.input, chat_id, show_draft=show_draft)
 
             # Special handling for send_audio — collect file path as side-channel
             if tu.name == "send_audio" and isinstance(result, dict) and "audio_file" in result:

@@ -24,6 +24,7 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
+from utils import write_secret_file
 from constants import (
     WHOOP_API_TIMEOUT_SECONDS,
     WHOOP_OAUTH_AUTHZ_URL,
@@ -49,10 +50,8 @@ def _read_env() -> dict:
         "redirect_uri": os.getenv("WHOOP_REDIRECT_URI", "").strip(),
     }
     missing = [k for k, v in cfg.items() if not v]
-    assert not missing, (
-        f"Missing Whoop env vars: {missing}. "
-        "Register a developer app at https://developer.whoop.com and fill in .env."
-    )
+    if missing:
+        raise ValueError(f"Set the missing WHOOP values in .env: {', '.join(missing)}")
     return cfg
 
 
@@ -82,15 +81,15 @@ async def _exchange_code_for_token(cfg: dict, code: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=WHOOP_API_TIMEOUT_SECONDS)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(WHOOP_OAUTH_TOKEN_URL, data=payload) as resp:
-            text = await resp.text()
             if resp.status != 200:
-                raise RuntimeError(f"Whoop token exchange failed ({resp.status}): {text}")
-            return json.loads(text)
+                raise RuntimeError(f"WHOOP token exchange failed (HTTP {resp.status}). Check the app credentials and reconnect.")
+            return await resp.json()
 
 
 def _persist_token(token_response: dict) -> None:
     """Save access_token, refresh_token, and absolute expires_at to disk."""
-    assert "access_token" in token_response, "token response missing access_token"
+    if not token_response.get("access_token") or not token_response.get("refresh_token"):
+        raise ValueError("WHOOP did not return an offline grant. Run python whoop_auth.py to reconnect.")
     expires_in = int(token_response.get("expires_in", 0))
     record = {
         "access_token": token_response["access_token"],
@@ -99,11 +98,11 @@ def _persist_token(token_response: dict) -> None:
         "scope": token_response.get("scope", WHOOP_OAUTH_SCOPES),
         "token_type": token_response.get("token_type", "bearer"),
     }
-    TOKEN_FILE.write_text(json.dumps(record, indent=2))
+    write_secret_file(TOKEN_FILE, json.dumps(record, indent=2))
     logger.info(f"Saved Whoop token to {TOKEN_FILE}")
 
 
-async def _run_callback_server(state: str) -> str:
+async def _run_callback_server(state: str, auth_url: str) -> str:
     """Run a single-shot aiohttp server, return the auth code once received."""
     assert state, "state token required"
     code_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -114,28 +113,29 @@ async def _run_callback_server(state: str) -> str:
         got_state = request.query.get("state", "")
         got_code = request.query.get("code", "")
         err = request.query.get("error", "")
-        if err:
-            code_future.set_exception(RuntimeError(f"Whoop returned error: {err}"))
-            return web.Response(text=f"Whoop returned error: {err}", status=400)
-        if got_state != state:
-            code_future.set_exception(RuntimeError("OAuth state mismatch — possible CSRF"))
+        if not secrets.compare_digest(got_state.encode(), state.encode()):
             return web.Response(text="State mismatch", status=400)
+        if err:
+            code_future.set_exception(RuntimeError("WHOOP authorization was declined."))
+            return web.Response(text="WHOOP authorization was declined.", status=400)
         if not got_code:
             code_future.set_exception(RuntimeError("No code in callback"))
             return web.Response(text="Missing code", status=400)
         code_future.set_result(got_code)
         return web.Response(
-            text="Whoop connected. You can close this tab and return to the terminal.",
+            text="Authorization received. You can close this tab and return to the terminal.",
             content_type="text/html",
         )
 
     app = web.Application()
     app.router.add_get("/callback", handler)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "localhost", WHOOP_OAUTH_CALLBACK_PORT)
     await site.start()
     try:
+        if not webbrowser.open(auth_url):
+            print(f"Open the authorization URL in a browser on this computer:\n{auth_url}")
         return await asyncio.wait_for(code_future, timeout=WHOOP_OAUTH_CALLBACK_TIMEOUT_SECONDS)
     finally:
         await runner.cleanup()
@@ -147,11 +147,9 @@ async def _main() -> int:
     url = _build_authz_url(cfg["client_id"], cfg["redirect_uri"], state)
 
     logger.info("Opening browser for Whoop consent…")
-    logger.info(f"If the browser does not open, paste this URL manually:\n{url}")
-    webbrowser.open(url)
 
     try:
-        code = await _run_callback_server(state)
+        code = await _run_callback_server(state, url)
     except asyncio.TimeoutError:
         logger.error("Timed out waiting for Whoop consent.")
         return 1

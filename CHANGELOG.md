@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-07
+
+- A smaller first install for Telegram chat, to-dos and reminders. Memory and voice have their own optional requirements. The setup guide covers Windows, macOS and Linux, an offline configuration check, and how to upgrade an existing installation.
+- Run chat, meeting analysis and WhatsApp summaries through a local Ollama model, or use Claude with the existing cloud features.
+- Private Telegram chats require an explicit allowlist. Email sends, replies and calendar events with guests show an approval preview.
+- Failed reminder deliveries stay pending for retry. The read-only WhatsApp bridge authenticates local imports and queues incoming messages across bot outages.
+- Set up additional Google accounts in `.env`. The example settings and the guide explain how to enable and verify each integration.
+
 ## [0.1.0] — 2026-05-01
 
 Initial public release.
@@ -33,5 +41,6 @@ Initial public release.
 - OAuth tokens cached locally, gitignored
 - Bounded retry loops on token refresh to prevent infinite loops
 
-[Unreleased]: https://github.com/pedropedropedropedrop/MyGG/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/pedropedropedropedrop/MyGG/releases/tag/v0.1.0
+[Unreleased]: https://github.com/pedropedropedropedrop/MyGG/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pedropedropedropedrop/MyGG/releases/tag/v0.2.0
+[0.1.0]: https://github.com/pedropedropedropedrop/MyGG/commit/2d12936c1342f52bb28023091a6b933645f88f04

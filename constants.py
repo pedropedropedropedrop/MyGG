@@ -11,6 +11,8 @@ TOOL_RESULT_MAX_CHARS = 6000      # Truncation limit for tool results sent back 
 
 # ── Email ───────────────────────────────────────────────────────────────────
 
+EMAIL_DRAFT_MAX_CHARS = 4096      # Maximum email body to preview for approval
+DRAFT_TTL_SECONDS = 600           # Telegram approval buttons expire after ten minutes
 EMAIL_BODY_MAX_CHARS = 3000       # Truncation limit for email body in read_email
 
 # ── Web (removed — now using Anthropic server-side tools) ──────────────────

@@ -48,39 +48,27 @@ if not exist "%MYGG_PYTHON%" (
 REM Create logs directory
 if not exist "%MYGG_LOGS%" mkdir "%MYGG_LOGS%"
 
+"%MYGG_PYTHON%" "%MYGG_HOME%\validate.py" || exit /b 1
 REM Install the service
-nssm install %SERVICE_NAME% "%MYGG_PYTHON%" "%MYGG_MAIN%"
-nssm set %SERVICE_NAME% AppDirectory "%MYGG_HOME%"
-nssm set %SERVICE_NAME% DisplayName "MyGG Personal AI Assistant"
-nssm set %SERVICE_NAME% Description "Telegram bot powered by Claude — personal AI assistant"
-nssm set %SERVICE_NAME% Start SERVICE_AUTO_START
-nssm set %SERVICE_NAME% AppStdout "%MYGG_LOGS%\mygg.log"
-nssm set %SERVICE_NAME% AppStderr "%MYGG_LOGS%\mygg-error.log"
-nssm set %SERVICE_NAME% AppRotateFiles 1
-nssm set %SERVICE_NAME% AppRotateBytes 10485760
-nssm set %SERVICE_NAME% AppExit Default Restart
-nssm set %SERVICE_NAME% AppRestartDelay 5000
+nssm install %SERVICE_NAME% "%MYGG_PYTHON%" "%MYGG_MAIN%" || exit /b 1
+nssm set %SERVICE_NAME% AppDirectory "%MYGG_HOME%" || exit /b 1
+nssm set %SERVICE_NAME% DisplayName "MyGG Personal AI Assistant" || exit /b 1
+nssm set %SERVICE_NAME% Description "Self-hosted Telegram personal assistant" || exit /b 1
+nssm set %SERVICE_NAME% Start SERVICE_AUTO_START || exit /b 1
+nssm set %SERVICE_NAME% AppStdout "%MYGG_LOGS%\mygg.log" || exit /b 1
+nssm set %SERVICE_NAME% AppStderr "%MYGG_LOGS%\mygg-error.log" || exit /b 1
+nssm set %SERVICE_NAME% AppRotateFiles 1 || exit /b 1
+nssm set %SERVICE_NAME% AppRotateBytes 10485760 || exit /b 1
+nssm set %SERVICE_NAME% AppExit Default Restart || exit /b 1
+nssm set %SERVICE_NAME% AppRestartDelay 5000 || exit /b 1
 
-if %errorlevel% equ 0 (
-    echo.
-    echo Service installed successfully.
-    echo.
-    echo Commands:
-    echo   nssm start %SERVICE_NAME%
-    echo   nssm stop %SERVICE_NAME%
-    echo   nssm restart %SERVICE_NAME%
-    echo   nssm status %SERVICE_NAME%
-    echo   nssm remove %SERVICE_NAME% confirm
-    echo.
-    echo Start now? (Y/N)
-    set /p START_NOW=
-    if /i "%START_NOW%"=="Y" (
-        nssm start %SERVICE_NAME%
-        echo %SERVICE_NAME% is running.
-    )
-) else (
-    echo Installation failed. Check the output above.
-)
-
-pause
-endlocal
+echo Service installed. To manage MyGG, run:
+echo   nssm start %SERVICE_NAME%
+echo   nssm stop %SERVICE_NAME%
+echo   nssm restart %SERVICE_NAME%
+echo   nssm status %SERVICE_NAME%
+echo   nssm remove %SERVICE_NAME% confirm
+choice /C YN /M "Start MyGG now"
+if errorlevel 2 exit /b 0
+nssm start %SERVICE_NAME%
+exit /b %errorlevel%

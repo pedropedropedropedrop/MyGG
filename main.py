@@ -2,6 +2,9 @@
 
 import os
 import logging
+import secrets
+import time
+from functools import partial
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,10 +14,14 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# HTTP request URLs from Telegram include the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -22,6 +29,8 @@ from telegram.ext import (
 )
 
 import agent
+import audio
+import llm
 import tools
 import heartbeat
 import whatsapp_server
@@ -32,18 +41,15 @@ import sys
 import modules
 
 ALLOWED_USER_IDS: set[int] = set()
-raw = os.getenv("ALLOWED_USER_IDS", "")
-if raw.strip():
-    ALLOWED_USER_IDS = {int(x.strip()) for x in raw.split(",") if x.strip()}
 
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
-
-from utils import split_long_message
-from constants import VOICE_LONG_THRESHOLD_SECONDS, FILE_READ_MAX_CHARS
+from utils import split_long_message, validate_access
+from constants import DRAFT_TTL_SECONDS, TELEGRAM_MAX_LENGTH, VOICE_LONG_THRESHOLD_SECONDS, FILE_READ_MAX_CHARS
 
 
-def _is_allowed(user_id: int) -> bool:
-    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+def _is_allowed(update: Update) -> bool:
+    user, chat = update.effective_user, update.effective_chat
+    return bool(user and chat and chat.type == "private" and chat.id == user.id
+                and user.id in ALLOWED_USER_IDS)
 
 
 async def _send_long(update: Update, text: str):
@@ -56,17 +62,20 @@ async def _send_long(update: Update, text: str):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
         return
     await update.message.reply_text(
         f"Hey {agent.USER_NAME}. I'm your AI assistant. Ask me anything, give me todos, "
-        "check your calendar, or just dump ideas — I'll remember everything.\n\n"
+        "check your calendar, or talk through an idea.\n\n"
         f"Your Telegram ID: {update.effective_user.id}"
     )
 
 
 async def opus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
+        return
+    if llm.LOCAL:
+        await update.message.reply_text(f"Local mode uses {llm.MODEL} for this chat.")
         return
     chat_id = update.effective_chat.id
     agent.model_overrides[chat_id] = agent.MODEL_OPUS
@@ -74,7 +83,7 @@ async def opus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sonnet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
         return
     chat_id = update.effective_chat.id
     agent.model_overrides.pop(chat_id, None)
@@ -82,13 +91,53 @@ async def sonnet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
         return
     chat_id = update.effective_chat.id
     current = agent.model_overrides.get(chat_id, agent.MODEL)
     is_override = chat_id in agent.model_overrides
     label = " (overridden)" if is_override else " (default)"
     await update.message.reply_text(f"Current model: {current}{label}")
+
+
+async def _show_draft(update: Update, context, preview: str, deliver) -> str:
+    """Keep one approval in this private chat. The token identifies the exact action."""
+    token = secrets.token_hex(12)
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Send", callback_data=f"draft:send:{token}"),
+        InlineKeyboardButton("Cancel", callback_data=f"draft:cancel:{token}"),
+    ]])
+    for offset in range(0, len(preview), TELEGRAM_MAX_LENGTH):
+        last = offset + TELEGRAM_MAX_LENGTH >= len(preview)
+        await update.message.reply_text(preview[offset:offset + TELEGRAM_MAX_LENGTH],
+                                        reply_markup=buttons if last else None,
+                                        disable_web_page_preview=True)
+    context.chat_data["draft"] = (token, time.monotonic() + DRAFT_TTL_SECONDS, deliver)
+    return "Draft shown in Telegram. Awaiting the user's Send button."
+
+
+async def handle_draft_approval(update: Update, context):
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer("Approval requires an authorized private chat.")
+        return
+    _, action, token = query.data.split(":")
+    draft = context.chat_data.get("draft")
+    if not draft or draft[0] != token or draft[1] <= time.monotonic():
+        await query.answer("This draft is no longer pending.")
+        return
+    # Consume before the first await so two clicks cannot send twice.
+    del context.chat_data["draft"]
+    await query.answer()
+    if action == "cancel":
+        result = "Draft cancelled."
+    else:
+        try:
+            result = await draft[2]()
+        except Exception:
+            logger.exception("Approved delivery could not be confirmed")
+            result = "Delivery status is unknown. Check your Google account before trying again."
+    await query.message.reply_text(result)
 
 
 async def _process_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE, user_content: str | list, force_opus: bool = False):
@@ -109,7 +158,9 @@ async def _process_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
 
     typing_task = asyncio.create_task(_keep_typing())
     try:
-        response, audio_files = await agent.handle_message(chat_id, user_content, force_opus=force_opus)
+        response, audio_files = await agent.handle_message(
+            chat_id, user_content, force_opus=force_opus, show_draft=partial(_show_draft, update, context)
+        )
         # Send text first (primary), then audio (supplementary)
         await _send_long(update, response)
         for audio_path in audio_files:
@@ -133,7 +184,7 @@ async def _process_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
         return
     await update.effective_chat.send_action("typing")
 
@@ -151,7 +202,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming voice notes and audio files — transcribe and process."""
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
+        return
+    if not audio.can_transcribe():
+        await update.message.reply_text(audio.VOICE_SETUP)
         return
 
     await update.effective_chat.send_action("typing")
@@ -172,6 +226,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tg_file.download_to_drive(temp_path)
 
         duration = voice.duration or 0
+        if hasattr(duration, "total_seconds"):
+            duration = int(duration.total_seconds())
         if duration > VOICE_LONG_THRESHOLD_SECONDS:
             # Long audio — route directly to meeting processing (not through Claude)
             await update.message.reply_text(
@@ -209,7 +265,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photos/screenshots — send to Claude with vision."""
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
+        return
+    if llm.LOCAL:
+        await update.message.reply_text("My local model handles text. Send the text from that image.")
         return
 
     await update.effective_chat.send_action("typing")
@@ -306,7 +365,7 @@ async def _handle_text_document(tmp_name, file_name, mime, caption, update, cont
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming documents — images, PDFs, audio files, text files."""
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
         return
 
     await update.effective_chat.send_action("typing")
@@ -320,6 +379,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mime = doc.mime_type or ""
     file_name = doc.file_name or "unknown"
+    audio_file = mime.startswith("audio/") or file_name.lower().endswith((".ogg", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".wma"))
+    if audio_file and not audio.can_transcribe():
+        await update.message.reply_text(audio.VOICE_SETUP)
+        return
+    if llm.LOCAL and (mime.startswith("image/") or mime == "application/pdf" or file_name.lower().endswith(".pdf")):
+        await update.message.reply_text("My local model handles text. Send the text from that file or image.")
+        return
     tg_file = await doc.get_file()
 
     suffix = os.path.splitext(file_name)[1] or ".bin"
@@ -334,7 +400,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _handle_image_document(tmp.name, mime, caption, update, context)
         elif mime == "application/pdf":
             await _handle_pdf_document(tmp.name, file_name, caption, update, context)
-        elif mime.startswith("audio/") or file_name.endswith((".ogg", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".wma")):
+        elif audio_file:
             await _handle_audio_document(tmp.name, file_name, caption, update, context)
         else:
             await _handle_text_document(tmp.name, file_name, mime, caption, update, context)
@@ -351,7 +417,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle shared GPS location — update weather location and respond."""
-    if not _is_allowed(update.effective_user.id):
+    if not _is_allowed(update):
         return
 
     await update.effective_chat.send_action("typing")
@@ -375,8 +441,14 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     try:
         due = await tools.check_due_reminders()
-        for chat_id, text in due:
-            await context.bot.send_message(chat_id=chat_id, text=f"\U0001f514 {text}")
+        for reminder_id, chat_id, text in due:
+            if chat_id in ALLOWED_USER_IDS and chat_id > 0:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=f"\U0001f514 Reminder: {text}")
+                except Exception:
+                    logger.warning("Reminder %s could not be delivered; will retry", reminder_id)
+                    continue
+            await tools.finish_reminder(reminder_id)
     except Exception:
         logger.exception("Reminder check failed")
 
@@ -386,6 +458,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 def _register_handlers(app):
     """Add all Telegram command and message handlers to the application."""
+    app.add_handler(CallbackQueryHandler(handle_draft_approval, pattern=r"^draft:(send|cancel):[0-9a-f]{24}$"))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("opus", opus_command))
     app.add_handler(CommandHandler("sonnet", sonnet_command))
@@ -405,36 +478,34 @@ def _schedule_jobs(app, tz):
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
 
     # Heartbeat jobs
-    app.job_queue.run_daily(heartbeat.morning_briefing, time=dt_time(7, 30, tzinfo=tz))
-    app.job_queue.run_daily(heartbeat.evening_wrapup, time=dt_time(21, 0, tzinfo=tz))
-    app.job_queue.run_repeating(heartbeat.check_upcoming_meetings, interval=300, first=30)
+    if heartbeat.OWNER_CHAT_ID:
+        app.job_queue.run_daily(heartbeat.morning_briefing, time=dt_time(7, 30, tzinfo=tz))
+        app.job_queue.run_daily(heartbeat.evening_wrapup, time=dt_time(21, 0, tzinfo=tz))
+        app.job_queue.run_repeating(heartbeat.check_upcoming_meetings, interval=300, first=30)
 
     # WhatsApp summarizer — every 30 minutes
-    app.job_queue.run_repeating(whatsapp_summarizer.summarize_whatsapp, interval=1800, first=60)
-    logger.info("WhatsApp summarizer scheduled every 30m")
+    if whatsapp_server.BRIDGE_SECRET and tools.memory_enabled():
+        app.job_queue.run_repeating(whatsapp_summarizer.summarize_whatsapp, interval=1800, first=60)
+        logger.info("WhatsApp summarizer scheduled every 30m")
 
 
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    global ALLOWED_USER_IDS
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        print("Set TELEGRAM_BOT_TOKEN in .env")
-        return
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("Set ANTHROPIC_API_KEY in .env")
-        return
+    if not llm.LOCAL and not os.getenv("ANTHROPIC_API_KEY", "").strip():
+        raise SystemExit("Set ANTHROPIC_API_KEY in .env or choose LLM_BACKEND=local")
+
+    try:
+        ALLOWED_USER_IDS, heartbeat.OWNER_CHAT_ID = validate_access()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     # Init database
     tools.init_db()
     logger.info("Database initialized")
-
-    # Pre-load Whisper model (CUDA loading mid-conversation can crash the process)
-    try:
-        from audio import transcriber
-        logger.info("Pre-loading Whisper model...")
-        transcriber.preload()
-    except Exception:
-        logger.exception("Failed to pre-load Whisper — voice notes will try lazy loading")
 
     # Discover domain modules
     modules.discover()
@@ -452,7 +523,6 @@ def main():
             logger.warning(f"WhatsApp server failed to start (port busy?): {e} — bot continues without it")
 
     app = Application.builder().token(token).post_init(_post_init).build()
-    logger.info(f"WhatsApp HTTP server will start on port {whatsapp_server.BRIDGE_PORT}")
 
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
@@ -461,11 +531,9 @@ def main():
     _schedule_jobs(app, tz)
 
     logger.info("Bot starting...")
-    logger.info("Heartbeat: morning 7:30 AM, evening 9:00 PM, meeting alerts every 5m")
-    if ALLOWED_USER_IDS:
-        logger.info(f"Restricted to user IDs: {ALLOWED_USER_IDS}")
-    else:
-        logger.info("No user restrictions (open to all)")
+    if heartbeat.OWNER_CHAT_ID:
+        logger.info("Heartbeat: morning 7:30 AM, evening 9:00 PM, meeting alerts every 5m")
+    logger.info("Restricted to %d authorized private chat(s)", len(ALLOWED_USER_IDS))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
