@@ -58,6 +58,6 @@ def test_chat_resumes_through_normal_entry_after_reopening(monkeypatch, tmp_path
     agent.conversations.clear()
     tools.init_db()
     asyncio.run(agent.handle_message(179, "What color was the shelf?"))
-    assert received[1][0] == {"role": "user", "content": "The shelf is blue."} or "The shelf is blue." in received[1][0]["content"]
+    assert received[1][0]["role"] == "user" and "The shelf is blue." in received[1][0]["content"]
     assert received[1][1]["role"] == "assistant"
     assert "What color was the shelf?" in received[1][-1]["content"]
