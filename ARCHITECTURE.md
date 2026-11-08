@@ -16,7 +16,7 @@ flowchart LR
 1. `main.py` receives an update through Telegram polling. It checks the chat type and sender, then routes the message or uploaded file. Short voice notes go through Whisper. Longer recordings and audio documents enter the meetings workflow.
 2. `agent.py` combines the message with bounded per-chat history, the optional personality file, and relevant memories if enabled. A per-chat lock serializes turns. The selected backend returns a response or requests a tool.
 3. The agent dispatches tool calls to `tools.py` or a discovered module and feeds results back to the model. In Claude mode the provider also offers hosted tools. Local mode uses Ollama for chat, briefings, meeting analysis and WhatsApp summarization. Unsupported cloud-only capabilities are disabled.
-4. `main.py` sends the result to the authorized Telegram chat. Sending Gmail or creating an event with guests requires a separate confirmation in that chat. Details and expiry are in the [Google setup guide](ONBOARDING.md#google-calendar-and-gmail).
+4. `main.py` sends the result to the authorized Telegram chat. Sending Gmail or WhatsApp text, or creating an event with guests, requires a separate confirmation in that chat. Details and expiry are in the [setup guide](ONBOARDING.md#google-calendar-and-gmail).
 
 ## Components
 
@@ -30,13 +30,17 @@ flowchart LR
 | `modules/weather.py`, `modules/whoop.py` | Location-based weather and WHOOP metrics, with context for briefings. |
 | `whatsapp-bridge/`, `whatsapp_server.py`, `whatsapp_summarizer.py` | A linked WhatsApp client forwards new messages to a secret-protected loopback receiver. Queries read the local message table. A scheduled job can summarize messages into long-term memory. |
 | `setup_calendar.py`, `whoop_auth.py` | Interactive authorization on the local machine. The resulting tokens grant the runtime access to the account. |
+| `modules/tasks.py`, `modules/goals.py`, `modules/feedback.py`, `modules/protagonism.py` | Editable tasks, goal history, item-level feedback, portfolio and knowledge lookup, initiative, and contextual follow-ups. |
+| `modules/_web.py`, `modules/_documents.py`, `modules/_outgoing.py` | Local web research, searchable PDF text, confirmed delivery and receipts. |
+| `connection_health.py`, `supervise.py` | Service checks and optional warm-up, owned-process restart and checked Git updates. See [operations](OPERATIONS.md). |
+| `evolve.py` | Handles direct owner code-change requests through Claude Code in a disposable checkout. |
 
 ## What persists
 
 | Data | Where it lives |
 | --- | --- |
-| Short conversation history, chat model overrides, unconfirmed actions | Process memory. Restarting clears them. |
-| To-dos, reminders, meeting records and captured WhatsApp messages | SQLite in `pa.db`. |
+| Recent conversations, outstanding approvals and delivery receipts | SQLite in `pa.db`. The chat history is bounded and excludes raw attachment bytes and hidden reasoning. Model overrides are session state. |
+| To-dos, goals, feedback, reminders, meeting records and captured WhatsApp messages | SQLite in `pa.db`. With the Google task backend, tasks live in Google Tasks. |
 | Full meeting transcripts | Text files under `meeting_transcripts/`. |
 | Optional long-term memory | mem0 uses Ollama for extraction/embedding and Qdrant for vector storage. Preserve the collection name, volume and user identifier on upgrades. |
 | Personalized instructions and most recent weather location | `personality.md` and `.current_location`. |

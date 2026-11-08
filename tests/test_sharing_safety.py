@@ -15,6 +15,11 @@ import whatsapp_server
 from utils import validate_access
 
 
+@pytest.fixture(autouse=True)
+def isolate_storage(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, "DB_PATH", tmp_path / "assistant.db")
+
+
 def update(user=7, chat=7, kind="private"):
     return SimpleNamespace(effective_user=SimpleNamespace(id=user),
                            effective_chat=SimpleNamespace(id=chat, type=kind),
@@ -65,8 +70,8 @@ def test_reply_requires_click_and_sends_frozen_message_once(monkeypatch):
     monkeypatch.setattr(tools, "_get_gmail_service", lambda account: service)
     monkeypatch.setattr(main, "ALLOWED_USER_IDS", {7})
     msg, context = update(), SimpleNamespace(chat_data={})
-    async def present(preview, deliver):
-        return await main._show_draft(msg, context, preview, deliver)
+    async def present(channel, preview, payload):
+        return await main._show_draft(msg, channel, preview, payload)
 
     args = {"email_id": "personal:msg1", "body": "See you soon."}
     assert "approval" in asyncio.run(agent._execute_tool("reply_email", args, 7))
@@ -92,20 +97,23 @@ def test_cancelled_or_stale_guest_invites_never_run(monkeypatch):
     monkeypatch.setattr(tools, "create_event", create)
     msg, context = update(), SimpleNamespace(chat_data={})
     args = {"title": "Meeting", "start": "2026-09-01T14:00", "attendees": ["guest@example.com"]}
-    async def present(preview, deliver):
-        return await main._show_draft(msg, context, preview, deliver)
+    async def present(channel, preview, payload):
+        return await main._show_draft(msg, channel, preview, payload)
 
     assert "approval" in asyncio.run(agent._execute_tool("create_event", args, 7))
     asyncio.run(agent._execute_tool("create_event", args, 7, present))
-    token, expires, deliver = context.chat_data["draft"]
-    msg.callback_query.data = f"draft:send:{token}"
+    from modules import _outgoing
+    msg.callback_query.data = msg.message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
     unauthorized = update(user=8, chat=7)
     unauthorized.callback_query.data = msg.callback_query.data
     asyncio.run(main.handle_draft_approval(unauthorized, context))
-    context.chat_data["draft"] = (token, 0, deliver)
+    assert _outgoing.get_outgoing_context(7)["status"] == "pending"
+    with tools.get_db() as conn:
+        conn.execute("UPDATE outgoing_drafts SET expires_at=0")
     asyncio.run(main.handle_draft_approval(msg, context))
-    context.chat_data["draft"] = (token, expires, deliver)
-    msg.callback_query.data = f"draft:cancel:{token}"
+    assert _outgoing.get_outgoing_context(7)["status"] == "expired"
+    asyncio.run(agent._execute_tool("create_event", args, 7, present))
+    msg.callback_query.data = msg.message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][1].callback_data
     asyncio.run(main.handle_draft_approval(msg, context))
-    assert "draft" not in context.chat_data
+    assert _outgoing.get_outgoing_context(7)["status"] == "cancelled"
     create.assert_not_awaited()

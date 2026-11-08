@@ -27,6 +27,10 @@ inbox/
 meeting_transcripts/
 voice_reference.wav
 .current_location
+.mygg-bot.lock
+.mygg-supervisor.lock
+.mygg-supervisor-stop
+.mygg-health.json
 .evolution_result
 qdrant_storage/
 whatsapp-bridge/pending-delivery/
@@ -46,3 +50,13 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+skillopt/last_run.json
+.mygg-inference.json
+.mygg-inference.tmp
+private/
+voice_reference.*
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg

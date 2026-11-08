@@ -178,11 +178,12 @@ async def _process_with_claude(transcript: str, context: dict) -> dict:
         try:
             response = await asyncio.wait_for(
                 llm.create(
+                    caller="meetings",
                     max_tokens=CLAUDE_MAX_TOKENS,
                     system=prompt,
                     messages=[{"role": "user", "content": f"## Meeting Transcript\n\n{transcript}"}],
                 ),
-                timeout=None if llm.LOCAL else CLAUDE_API_TIMEOUT_SECONDS,
+                timeout=None if llm.uses_local("meetings") else CLAUDE_API_TIMEOUT_SECONDS,
             )
             text = llm.text(response)
             if not text:
@@ -447,10 +448,11 @@ Update the meeting information based on the user's answers. Return JSON with:
     try:
         response = await asyncio.wait_for(
             llm.create(
+                caller="meetings",
                 max_tokens=2048,
                 messages=[{"role": "user", "content": refine_prompt}],
             ),
-            timeout=None if llm.LOCAL else CLAUDE_CLARIFY_TIMEOUT_SECONDS,
+            timeout=None if llm.uses_local("meetings") else CLAUDE_CLARIFY_TIMEOUT_SECONDS,
         )
         updates = _parse_clarification_response(llm.text(response))
     except Exception as e:

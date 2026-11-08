@@ -12,8 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A smaller first install for Telegram chat, to-dos and reminders. Memory and voice have their own optional requirements. The setup guide covers Windows, macOS and Linux, an offline configuration check, and how to upgrade an existing installation.
 - Run chat, meeting analysis and WhatsApp summaries through a local Ollama model, or use Claude with the existing cloud features.
 - Private Telegram chats require an explicit allowlist. Email sends, replies and calendar events with guests show an approval preview.
-- Failed reminder deliveries stay pending for retry. The read-only WhatsApp bridge authenticates local imports and queues incoming messages across bot outages.
+- Failed reminder deliveries stay pending for retry. The WhatsApp bridge queues incoming messages across bot outages and can send a text after its exact recipient and contents are approved in Telegram.
 - Set up additional Google accounts in `.env`. The example settings and the guide explain how to enable and verify each integration.
+- Start with empty goals, editable tasks, feedback and conversation history. Configure Google Tasks, a project board or a private knowledge collection, and enable a personal schedule for briefings, inbox triage, follow-ups and leisure suggestions.
+- Added local PDF reading, optional image understanding, local-model web research and multilingual Chatterbox speech with a user-supplied voice reference. Model selection can be configured per workload.
+- Advanced installations can enable connection checks, process supervision, verified updates, local inference recovery and owner-requested code changes in their own Git checkout.
 
 ## [0.1.0] — 2026-05-01
 

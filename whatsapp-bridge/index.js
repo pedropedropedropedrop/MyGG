@@ -1,4 +1,5 @@
 const pino = require("pino");
+const { makeControlServer } = require("./control");
 const { DeliveryQueue, postJson } = require("./delivery-queue");
 const path = require("path");
 
@@ -28,6 +29,16 @@ function stopForDeliveryError(error) {
   logger.fatal({ err: error.message }, "Delivery queue failed; existing pending messages are preserved");
   process.exit(1);
 }
+
+let activeSocket;
+let connectionState = "connecting";
+const control = makeControlServer({
+  secret: BRIDGE_SECRET,
+  status: () => ({ connection: connectionState, pending_incoming: deliveryQueue.size }),
+  send: (jid, message) => activeSocket.sendMessage(jid, message),
+});
+const controlPort = Number(process.env.WHATSAPP_HEALTH_PORT || 8786);
+control.listen(controlPort, "127.0.0.1");
 
 // ── Extract text from message ───────────────────────────────────────────────
 
@@ -61,12 +72,17 @@ async function startBridge() {
     syncFullHistory: false,
   });
 
+  activeSocket = sock;
+  connectionState = "connecting";
+
   // Save credentials on update
   sock.ev.on("creds.update", saveCreds);
 
   // Connection status + QR code handling
   sock.ev.on("connection.update", (update) => {
+    if (sock !== activeSocket) return;
     const { connection, lastDisconnect, qr } = update;
+    if (connection) connectionState = connection;
 
     if (qr) {
       const QRCode = require("qrcode");

@@ -22,13 +22,17 @@ MyGG is a personal-scale project. The roadmap reflects what one person can reali
 - [x] Local chat model via Ollama, including local meeting and WhatsApp summaries.
 - [x] Text-only setup with separate voice and memory packages.
 - [x] Telegram approval for outgoing email and calendar invitations.
+- [x] Approved WhatsApp sending, stored receipts and durable message delivery.
+- [x] Google Tasks, saved goals, item feedback, proactive research, board and knowledge lookup.
+- [x] Local PDF text, supported local vision and optional multilingual voice.
+- [x] Connection monitoring, supervised updates and owner-directed module development.
 
 ## Near-term ideas
 
 - [ ] One-shot install scripts for macOS (`install.sh`) and Linux (`install.sh`)
 - [ ] Pluggable LLM provider — swap Anthropic for an OpenAI-compatible endpoint
 - [ ] Pluggable vector store — swap Qdrant for Chroma or pgvector
-- [ ] More example modules (Google Tasks, Apple Reminders bridge, Spotify, Notion)
+- [ ] More example modules (Apple Reminders bridge, Spotify, Notion)
 - [ ] First-run wizard that walks the user through `.env` and OAuth interactively
 - [ ] Optional web dashboard for memory inspection and conversation history
 - [ ] Test coverage above 50%

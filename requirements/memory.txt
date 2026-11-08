@@ -1,3 +1,5 @@
 # Optional long-term memory. Install after requirements.txt.
 mem0ai==1.0.5
 ollama>=0.6,<1
+qdrant-client>=1.10,<2
+openai>=1,<4

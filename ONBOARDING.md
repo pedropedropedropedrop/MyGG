@@ -45,7 +45,7 @@ Leave this terminal open. All remaining `python` commands work as written. Each 
 
 1. In Telegram, open the verified **@BotFather**, send `/newbot`, choose a display name and a unique username ending in `bot`. Copy the token it gives you. [Telegram's bot guide](https://core.telegram.org/bots/tutorial)
 2. Find your personal numeric Telegram ID. One way is to message **@userinfobot** from your account and read the ID it returns. Your numeric ID and your bot token are different values. Only enter the token in your own installation.
-3. Open **`.env`** in a text editor. From your terminal, use `notepad .env` on Windows, `open -e .env` on macOS, or `nano .env` on Linux. Replace the values in the existing lines as shown below, using your real token and ID. Use your personal ID on both ID lines if you want scheduled briefings. You can leave `OWNER_CHAT_ID=` blank to turn them off.
+3. Open **`.env`** in a text editor. From your terminal, use `notepad .env` on Windows, `open -e .env` on macOS, or `nano .env` on Linux. Replace the values in the existing lines as shown below, using your real token and ID. Enter your personal ID on both ID lines to enable briefings, proactive research and connection notices. Scheduled AI work uses your model account even when you haven't sent a message. Leave `OWNER_CHAT_ID=` blank to start with the owner schedule off. You can still chat and set reminders.
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=PASTE_YOUR_BOT_TOKEN_HERE
@@ -65,6 +65,7 @@ Use a timezone such as `America/Chicago` or `Europe/London`. Each person should 
 
 ```sh
 ollama pull qwen3:8b
+ollama create mygg-chat -f ollama/Modelfile.mygg-chat
 ollama list
 ```
 
@@ -72,12 +73,16 @@ Set these lines in `.env`. You can leave `ANTHROPIC_API_KEY` empty.
 
 ```dotenv
 LLM_BACKEND=local
-LOCAL_MODEL=qwen3:8b
+LOCAL_MODEL=mygg-chat
 ```
 
-Local chat uses Ollama's service on port 11434. GG also routes meeting analysis, briefings and WhatsApp summaries through the local model. It supports text uploads and transcribed voice. Select Claude when you need images, PDFs, Anthropic web tools, hosted code execution or Edge speech output. Local mode still uses Telegram and any external accounts you connect.
+Local chat uses Ollama's service on port 11434. GG also routes background research, meeting analysis and WhatsApp summaries through the local model. You can upload text and PDFs with selectable text. For images, choose an installed vision-capable model, put its exact name in `LOCAL_MODEL` and set `LOCAL_VISION=true`. Scanned PDFs need OCR or a cloud model with native PDF support. Claude offers native image/PDF analysis, hosted search, web fetch, code execution and optional Edge speech output.
 
-If tool calls drop details or replies are cut off, check the model's context window with `ollama ps` while it is loaded. If it is below 16K, set `OLLAMA_CONTEXT_LENGTH=16384` in the **Ollama server environment** and restart Ollama. A larger window uses more memory. [Ollama context length](https://docs.ollama.com/context-length) · [Set Ollama environment variables on your OS](https://docs.ollama.com/faq#how-do-i-configure-ollama-server)
+Set `LOCAL_THINKING` to `off`, `low`, `medium` or `high` according to your model's reasoning support. To use Claude for chat while moving only certain work to Ollama, keep `LLM_BACKEND=anthropic` and set one or more of `LLM_BACKEND_MAIN`, `LLM_BACKEND_SUBAGENT`, `LLM_BACKEND_MEETINGS`, `LLM_BACKEND_WHATSAPP` to `local`. The global `local` setting routes all model calls to Ollama. Telegram, optional online tools and any connected accounts still use their network services.
+
+**Web research with Ollama.** Run `python -m pip install -r requirements/web.txt`, set `ENABLE_LOCAL_WEB=true` and restart. GG can search using DDGS and read public web pages. Try **“Find the official website for my local museum.”** Optional `ENABLE_JINA_READER=true` lets GG send a page URL to Jina for rendering, with `JINA_API_KEY` if you use an account. [Jina Reader](https://jina.ai/reader/)
+
+The `mygg-chat` alias requests a 32K context window for GG's tool descriptions and conversation history. Check the loaded context with `ollama ps`. If you choose another installed model, give it a comparable window and ensure it supports tool calls. Two optional model profiles are in `ollama/` for larger hardware. For example, run `ollama create gg-local-gptoss -f ollama/Modelfile.gg-local-gptoss` and set `LOCAL_MODEL=gg-local-gptoss`. Larger models and longer contexts use more memory. [Ollama context length](https://docs.ollama.com/context-length)
 
 ## First conversation
 
@@ -95,7 +100,39 @@ Copy `personality.md.example` to `personality.md` beside `main.py`. Edit it with
 
 ### Briefings
 
-Set `OWNER_CHAT_ID` to your own allowlisted Telegram ID and set `TIMEZONE` in `.env`. Start the private chat once and leave GG running. The morning briefing is scheduled for **7:30 a.m.** and the evening wrap-up for **9 p.m.** in your chosen timezone. Connecting Google enables upcoming-meeting alerts. Weather and WHOOP add context when those accounts are configured.
+Set `OWNER_CHAT_ID` to your own allowlisted Telegram ID and set `TIMEZONE` in `.env`. Start the private chat once and leave GG running. These schedules use your timezone.
+
+| When | What GG does |
+| --- | --- |
+| 7:30 a.m. and 9 p.m. | Morning briefing and evening wrap-up, with a weekly review on Sunday evening. Background research can gather context in parallel from available tools. Weather and WHOOP can add context. Google Calendar enables pre-meeting alerts. |
+| 9 a.m., 1 p.m. and 5 p.m. | Checks connected inboxes for mail needing a reply and can create a deduplicated follow-up task. |
+| 10 a.m. and 3 p.m., plus a variable delay | Checks for a timely suggestion from your goals, projects and commitments. Duplicate, dismissed and snoozed suggestions are filtered. |
+| Fridays at 4 p.m. | Prepares a leisure menu for the week ahead. |
+| Shortly after startup and daily at 8 a.m. | Checks configured connections. Changes trigger a notice. Monday includes a weekly digest. |
+
+### Tasks, goals and follow-ups
+
+Start with **“Add a high-priority task to book the studio for Friday.”** Ask to list tasks, edit its date or priority, mark it complete, or delete it. The default backend stores tasks in `pa.db`.
+
+To use **Google Tasks**, enable the Google Tasks API in the same Google project as Calendar and Gmail. Set `TODO_BACKEND=google` in `.env`, run `python setup_calendar.py personal` again to authorize the additional scope, then restart GG. Ask it to create a test task and check your Google Tasks list. Switching back to `TODO_BACKEND=sqlite` shows your local list again. The stores are independent. [Google Tasks setup](https://developers.google.com/workspace/tasks/quickstart/python)
+
+Tell GG your monthly outcome, this week's priorities or a change in direction. Ask **“What changed since my last goal review?”** to use its dated history. To act on a suggestion, reply directly to GG's message with **“Snooze this until Friday”**, **“Dismiss this”** or **“Reopen this.”** You can also ask GG to schedule a contextual follow-up, such as **“Check in next Tuesday about the studio booking.”**
+
+### Project board and knowledge sources
+
+For a project board, set `BOARD_DIR` to your own folder. Create a file inside called `task-studio.md` and use the example below. Restart and ask **“What's on my project board?”**
+
+```markdown
+---
+title: Studio booking
+status: Active
+priority: High
+---
+## Acceptance Criteria
+- [ ] Confirm the date with the studio.
+```
+
+To search your own notes, set `KNOWLEDGE_DIR` to a folder of Markdown or plain-text files, add a note, restart and ask a question about it. For an existing Qdrant knowledge index, first run `python -m pip install -r requirements/memory.txt`. Leave `KNOWLEDGE_DIR` blank and set `KNOWLEDGE_QDRANT_URL`, `KNOWLEDGE_COLLECTION`, `KNOWLEDGE_QDRANT_API_KEY` if needed, and `OPENAI_API_KEY`. Set `KNOWLEDGE_EMBED_MODEL` to the model used to index your documents. Cloud-mode vector searches use billable OpenAI embeddings. The local notes option works with either chat backend.
 
 ### Long-term memory
 
@@ -117,7 +154,7 @@ To-dos and reminders already persist in a local SQLite file. Add semantic memory
    ```
 
 4. Open `http://127.0.0.1:6333/dashboard` locally to check Qdrant. Set `ENABLE_MEMORY=true` in `.env` and restart GG. Keep Ollama and Qdrant running.
-5. Send **“Remember that my favorite tea is jasmine.”** Restart GG and ask **“What is my favorite tea?”** The restart clears the short chat history, so this tests long-term recall.
+5. Send **“Remember that my favorite tea is jasmine.”** Then ask **“Use long-term memory to recall my favorite tea.”** Recent chat context also survives restarts in `pa.db`. You can inspect the configured memory collection in Qdrant's local dashboard to verify a fact reached the separate vector store.
 
 ### Voice and meetings
 
@@ -125,14 +162,18 @@ To-dos and reminders already persist in a local SQLite file. Add semantic memory
 2. Send a short voice note and check GG's reply. In Claude mode, ask **“Read that back to me as a voice note.”** Edge TTS sends the reply text to Microsoft's speech service. Set `TTS_VOICE` to choose a voice.
 3. To create meeting notes, attach a recording as an audio document. Voice notes over 30 seconds also enter meeting processing. Add a caption for context. GG saves the transcript in `meeting_transcripts/`, extracts decisions and can add your action items to the to-do list. Try **“Show my latest meeting notes.”**
 
+For local spoken replies, install `python -m pip install -r requirements/chatterbox.txt`. Set `TTS_ENGINE=chatterbox`, `TTS_DEVICE=cpu` (or a compatible `cuda`/`mps` accelerator) and `GG_VOICE_LANG=en` or another supported language. The first use downloads the multilingual speech model. Use its standard voice or set `GG_VOICE_REF` to the full path of a recording you have permission to use. Put personal recordings in the ignored `private/` folder or a location outside the repo. Optional `TTS_EXAGGERATION` adjusts expression. In cloud mode, `TTS_EDGE_FALLBACK=true` lets GG send reply text to Edge if local synthesis fails. This fallback is off by default and unavailable in global local mode. Restart and ask GG to say a short sentence aloud. [Chatterbox requirements and languages](https://github.com/resemble-ai/chatterbox)
+
 ### Google Calendar and Gmail
 
 1. Create a project in Google Cloud. Enable **Google Calendar API** and **Gmail API**. Configure the OAuth consent screen. If the app is in testing, add your Google account as a test user. [Calendar setup](https://developers.google.com/workspace/calendar/api/quickstart/python) · [Gmail setup](https://developers.google.com/workspace/gmail/api/quickstart/python)
 2. Create an **OAuth client ID** of type **Desktop app**. Download its JSON and save it as `credentials.json` beside `main.py`.
 3. Run `python setup_calendar.py` on the computer running GG. In the browser, select the account you want to connect, review the requested Calendar and Gmail permissions, and approve. The helper uses a temporary callback on port 8090 and saves `token.json`.
-4. Restart GG. Ask **“What's on my calendar tomorrow?”** or **“List my last three unread emails.”** To test outgoing email, ask GG to send a message to yourself. In the private Telegram preview, review the recipient and content, then choose **Send** or **Cancel**. Replies and calendar events with guests also require approval. Only the newest preview in that chat is valid, for ten minutes. Restarting clears pending approvals.
+4. Restart GG. Ask **“What's on my calendar tomorrow?”** or **“List my last three unread emails.”** To test outgoing email, ask GG to send a message to yourself. In the private Telegram preview, review the recipient and content, then choose **Send** or **Cancel**. Replies and calendar events with guests also require approval. Only the newest preview in that chat is valid, for ten minutes. The draft and its delivery status persist locally across restarts.
 
 To connect a second account, add `GOOGLE_EXTRA_ACCOUNTS=work` to `.env`. Optionally set `GOOGLE_ACCOUNT_WORK_LABEL=Work`. Run `python setup_calendar.py work`, sign in to that account and restart GG. Ask **“Show tomorrow's events on my work calendar.”** For several accounts, list their names separated by commas. Start each name with a lowercase letter and use lowercase letters, digits or underscores.
+
+To require a particular sign-in identity, set `GOOGLE_ACCOUNT_EMAIL` for your default account or `GOOGLE_ACCOUNT_WORK_EMAIL` for an account named `work` before running authorization.
 
 ### Weather
 
@@ -144,7 +185,7 @@ Register a WHOOP developer app with the redirect URI `http://localhost:8788/call
 
 ### WhatsApp
 
-The optional read-only bridge links as a WhatsApp device and stores new messages and captions it receives while running. It skips offline history. You can search that local message history immediately. With long-term memory enabled, a scheduled summary also processes messages through your selected model and saves relevant context.
+The optional bridge links as a WhatsApp device and stores new messages and captions it receives while running. It skips offline history. You can search that local message history immediately. With long-term memory enabled, a scheduled summary also processes messages through your selected model and saves relevant context.
 
 1. Install Node.js 22.12 or newer with npm. From the MyGG folder run `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Paste the generated value into `WHATSAPP_BRIDGE_SECRET` in the project's `.env`. Both processes read this same file. [Node.js downloads](https://nodejs.org/en/download)
 2. Restart GG. In a **second terminal** inside the MyGG folder, run the following commands and leave it open.
@@ -158,9 +199,19 @@ The optional read-only bridge links as a WhatsApp device and stores new messages
 3. When pairing is requested, open the QR image `whatsapp-bridge/qr.png` on the computer. On your phone, go to WhatsApp's **Linked devices → Link a device** and scan it. The bridge saves its session in `whatsapp-bridge/auth_state/`.
 4. After a new test message arrives, ask GG **“Summarize my WhatsApp from the last hour.”** Keep the Python bot and bridge running. If the Python receiver is unavailable, the bridge keeps messages in `whatsapp-bridge/pending-delivery/` and retries. To disconnect, stop the bridge and unlink it under **Linked devices** on your phone.
 
+To send a text, name a person or group seen in GG's captured WhatsApp history, or supply its exact chat ID. GG asks you to review the recipient and text in Telegram. Press **Send** only when the preview is correct. Incoming delivery uses `WHATSAPP_BRIDGE_PORT` (8787) and outbound control/status uses `WHATSAPP_HEALTH_PORT` (8786). Both are local to your computer.
+
+### Owner-requested code changes
+
+Use a clean **Git clone** of your own fork, connect Claude, install the Claude Code CLI on your PATH and run `python -m pip install pytest` in the MyGG environment. Enter your own ID as `OWNER_CHAT_ID` and configure a private `EVOLVE_SAFEWORD` in `.env`. Restart GG. In a direct message you type yourself, send `/evolve YOUR_SAFEWORD add a module that …`. The command and safeword pass through Telegram. [Claude Code setup](https://code.claude.com/docs/en/setup)
+
+GG lets the CLI prepare Python module or test changes in a disposable checkout. It runs setup validation and the test suite before applying the commit locally and restarting. A failed check leaves the running source intact. If you want successful changes pushed to your fork, point `origin` at that fork, configure your Git credentials and set `EVOLVE_PUSH=true`. Your private settings and existing code edits stay outside this workflow.
+
 ### Keep GG running
 
 For regular use, leave the foreground terminal open or use the Windows launcher `.\start-gg.ps1` from the project folder. A sleeping computer pauses the bot. For automatic startup on Windows, first verify the foreground setup, install NSSM on your PATH, stop the terminal copy, then run `.\setup_service.bat` from an administrator terminal. It registers a service named `MyGG`. Use `nssm start MyGG`, `nssm status MyGG` and `nssm stop MyGG` to manage it. Service logs are in `logs/`. Start Ollama, Docker and the WhatsApp bridge separately when you use them. [NSSM](https://nssm.cc/download)
+
+For an automatic restart after a crash, a supervised bridge, update checks or recovery of a dedicated local model server, see [Supervision and recovery](OPERATIONS.md). Use one startup method per installation.
 
 ## Update an existing installation
 

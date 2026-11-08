@@ -35,11 +35,13 @@ def reply(content, stop="end_turn"):
     })
 
 
-def test_local_tool_roundtrip_and_media(monkeypatch):
+def test_local_tool_roundtrip_and_media(monkeypatch, tmp_path):
     backend = load_backend(monkeypatch, "local")
     monkeypatch.setattr(agent, "llm", backend)
     monkeypatch.setenv("ENABLE_MEMORY", "false")
     monkeypatch.setattr(agent, "conversations", {})
+    monkeypatch.setattr(tools, "DB_PATH", tmp_path / "test.db")
+    tools.init_db()
     monkeypatch.setattr(agent, "model_overrides", {9: "some-cloud-model"})
     monkeypatch.setattr(tools, "list_todos", AsyncMock(return_value="Pick up milk"))
     requests = []
@@ -133,9 +135,13 @@ def test_meeting_and_whatsapp_generation(monkeypatch, tmp_path):
 def test_memory_receipts_and_unstored_whatsapp_batch(monkeypatch, tmp_path):
     monkeypatch.setenv("ENABLE_MEMORY", "true")
     memory = Mock()
-    memory.add.return_value = {"results": []}
+    memory.add.side_effect = [{"results": []}, {"results": [{"id": "saved", "event": "ADD"}]}]
     monkeypatch.setattr(tools, "_get_memory", lambda: memory)
-    assert "No new" in asyncio.run(tools.remember("Duplicate preference"))
+    assert "Stored:" in asyncio.run(tools.remember("Example preference"))
+    assert memory.add.call_args.kwargs["infer"] is False
+    assert memory.add.call_args.kwargs["metadata"]["verbatim_fallback"] is True
+    memory.add.side_effect = None
+    memory.add.return_value = {"results": []}
     monkeypatch.setattr(tools, "DB_PATH", tmp_path / "store.db")
     tools.init_db()
     db = tools.get_db()
@@ -242,3 +248,27 @@ def test_meeting_uses_extended_transcription_deadline(monkeypatch):
     monkeypatch.setattr(tools, "transcribe_audio", transcribe)
     assert asyncio.run(meetings._transcribe_audio("upload.wav"))[0] == "Meeting decisions"
     transcribe.assert_awaited_once_with("upload.wav", timeout=600)
+
+def test_mixed_workloads_keep_web_and_vector_lookup_on_the_selected_backend(monkeypatch):
+    from modules import _web, protagonism
+    monkeypatch.setattr(llm, "LOCAL", False)
+    monkeypatch.setenv("LLM_BACKEND_MAIN", "anthropic")
+    monkeypatch.setenv("LLM_BACKEND_SUBAGENT", "local")
+    monkeypatch.setenv("ENABLE_LOCAL_WEB", "true")
+    monkeypatch.delenv("KNOWLEDGE_DIR", raising=False)
+    monkeypatch.setenv("KNOWLEDGE_QDRANT_URL", "https://vector.example.invalid")
+    monkeypatch.setenv("KNOWLEDGE_COLLECTION", "fixture")
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-only")
+    cloud_defs = {t["name"]: t for t in agent._get_all_tool_definitions("main")}
+    local_defs = {t["name"]: t for t in agent._get_all_tool_definitions("subagent")}
+    assert cloud_defs["web_search"]["type"].startswith("web_search_")
+    assert "input_schema" in local_defs["web_search"]
+    called = AsyncMock(return_value="Synthetic public search")
+    monkeypatch.setattr(_web, "search", called)
+    assert "hosted" in asyncio.run(agent._execute_tool("web_search", {"query": "synthetic"}, 7))
+    called.assert_not_awaited()
+    assert "Synthetic" in asyncio.run(agent._execute_tool("web_search", {"query": "synthetic"}, 7, caller="subagent"))
+    monkeypatch.setattr(agent.modules, "_tool_dispatch", {"search_knowledge_base": protagonism})
+    answer = asyncio.run(agent._execute_tool("search_knowledge_base", {"question": "private fixture"}, 7, caller="subagent"))
+    assert "KNOWLEDGE_DIR" in answer
+    assert llm.tool_caller.get() == "main"

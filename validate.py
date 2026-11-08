@@ -42,6 +42,17 @@ def main() -> int:
         import tools
         if tools.memory_enabled() and any(find_spec(p) is None for p in ("mem0", "ollama")):
             raise ValueError("Install requirements/memory.txt or set ENABLE_MEMORY=false.")
+        if os.getenv("ENABLE_LOCAL_WEB", "").lower() == "true" and find_spec("ddgs") is None:
+            raise ValueError("Install requirements/web.txt or set ENABLE_LOCAL_WEB=false.")
+        engine = os.getenv("TTS_ENGINE", "edge").lower()
+        if engine not in {"chatterbox", "edge"}:
+            raise ValueError("Set TTS_ENGINE to edge or chatterbox.")
+        if engine == "chatterbox":
+            if find_spec("chatterbox") is None:
+                raise ValueError("Install requirements/chatterbox.txt before selecting Chatterbox.")
+            ref = os.getenv("GG_VOICE_REF", "").strip()
+            if ref and not Path(ref).expanduser().is_file():
+                raise ValueError("Check the private reference recording path in GG_VOICE_REF.")
         # Discovery can initialize module tables. Test it against a disposable database.
         import modules
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,7 +61,8 @@ def main() -> int:
             import main as bot
             bot.ALLOWED_USER_IDS, bot.heartbeat.OWNER_CHAT_ID = allowed, owner
             modules.discover()
-            missing = {"meetings", "weather", "whoop"} - set(modules.get_module_names())
+            expected = {p.stem for p in (PROJECT_DIR / "modules").glob("*.py") if not p.name.startswith("_")}
+            missing = expected - set(modules.get_module_names())
             if missing:
                 raise ValueError("Could not load these built-in modules: " + ", ".join(sorted(missing)))
             from telegram.ext import Application

@@ -4,16 +4,28 @@ Use python setup_calendar.py for your personal account. For a second account,
 set GOOGLE_EXTRA_ACCOUNTS=work in .env and run python setup_calendar.py work.
 """
 
+import logging
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 load_dotenv(Path(__file__).with_name(".env"))
-from tools import GOOGLE_ACCOUNTS, GOOGLE_SCOPES
+from tools import GOOGLE_ACCOUNTS, GOOGLE_SCOPES, TODO_BACKEND
 from utils import write_secret_file
 
 CREDS_PATH = Path(__file__).parent / "credentials.json"
+
+
+def _verify_google_identity(creds, expected):
+    from google.auth.transport.requests import AuthorizedSession
+    with AuthorizedSession(creds) as session:
+        resp = session.get("https://gmail.googleapis.com/gmail/v1/users/me/profile", timeout=10)
+        resp.raise_for_status()
+        actual = resp.json().get("emailAddress", "")
+    if not actual or (expected and actual.casefold() != expected.casefold()):
+        raise ValueError("Google returned a different account than configured. Existing authorization was preserved.")
+    return actual
 
 
 def main():
@@ -40,8 +52,17 @@ def main():
         raise SystemExit(1)
     print(f"\nA browser window will open. Sign in with the {acct['label']} account.\n")
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), GOOGLE_SCOPES)
-    creds = flow.run_local_server(port=8090, open_browser=True)
+    scopes = list(GOOGLE_SCOPES)
+    if account == "personal" and TODO_BACKEND == "google":
+        scopes.append("https://www.googleapis.com/auth/tasks")
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), scopes)
+    # The loopback URL contains an authorization code.
+    logging.getLogger("google_auth_oauthlib.flow").setLevel(logging.WARNING)
+    expected = acct["email"]
+    creds = flow.run_local_server(port=8090, open_browser=True, timeout_seconds=300, prompt="select_account",
+                                  **({"login_hint": expected} if expected else {}))
+    actual = _verify_google_identity(creds, expected)
+    print(f"Authorized Google account: {actual}")
     write_secret_file(acct["token_path"], creds.to_json())
     print(f"\nAuthorization successful! Token saved to {acct['token_path']}")
 

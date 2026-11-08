@@ -2,8 +2,6 @@
 
 import os
 import logging
-import secrets
-import time
 from functools import partial
 from dotenv import load_dotenv
 
@@ -33,6 +31,7 @@ import audio
 import llm
 import tools
 import heartbeat
+from modules import feedback, protagonism
 import whatsapp_server
 import whatsapp_summarizer
 import asyncio
@@ -43,7 +42,7 @@ import modules
 ALLOWED_USER_IDS: set[int] = set()
 
 from utils import split_long_message, validate_access
-from constants import DRAFT_TTL_SECONDS, TELEGRAM_MAX_LENGTH, VOICE_LONG_THRESHOLD_SECONDS, FILE_READ_MAX_CHARS
+from constants import TELEGRAM_MAX_LENGTH, VOICE_LONG_THRESHOLD_SECONDS, FILE_READ_MAX_CHARS
 
 
 def _is_allowed(update: Update) -> bool:
@@ -74,7 +73,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def opus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update):
         return
-    if llm.LOCAL:
+    if llm.uses_local():
         await update.message.reply_text(f"Local mode uses {llm.MODEL} for this chat.")
         return
     chat_id = update.effective_chat.id
@@ -100,9 +99,37 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Current model: {current}{label}")
 
 
-async def _show_draft(update: Update, context, preview: str, deliver) -> str:
+async def evolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update) or update.effective_user.id != heartbeat.OWNER_CHAT_ID:
+        return
+    import evolve
+    import subprocess
+    message = update.message
+    if message.forward_origin or llm.LOCAL or not os.getenv("EVOLVE_SAFEWORD"):
+        await message.reply_text("Code updates require an original owner command, Claude mode and EVOLVE_SAFEWORD.")
+        return
+    if len(context.args) < 2 or not evolve.authorized(context.args[0]):
+        await message.reply_text("Use /evolve followed by your safeword and the module change you want.")
+        return
+    await message.reply_text("Preparing and testing the change in a clean copy.")
+    try:
+        result = await asyncio.to_thread(evolve.evolve, " ".join(context.args[1:]), context.args[0])
+    except ValueError as exc:
+        await message.reply_text(str(exc))
+        return
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Code update failed (%s)", type(exc).__name__)
+        await message.reply_text("The update failed. Check Git, Claude Code authentication and the test dependencies.")
+        return
+    await message.reply_text(result + ". Restarting GG.")
+    context.application.bot_data["restart_after_update"] = True
+    context.application.stop_running()
+
+
+async def _show_draft(update: Update, channel: str, preview: str, payload: dict) -> str:
     """Keep one approval in this private chat. The token identifies the exact action."""
-    token = secrets.token_hex(12)
+    from modules import _outgoing
+    token = _outgoing.prepare(update.effective_chat.id, channel, preview, payload)
     buttons = InlineKeyboardMarkup([[
         InlineKeyboardButton("Send", callback_data=f"draft:send:{token}"),
         InlineKeyboardButton("Cancel", callback_data=f"draft:cancel:{token}"),
@@ -112,7 +139,7 @@ async def _show_draft(update: Update, context, preview: str, deliver) -> str:
         await update.message.reply_text(preview[offset:offset + TELEGRAM_MAX_LENGTH],
                                         reply_markup=buttons if last else None,
                                         disable_web_page_preview=True)
-    context.chat_data["draft"] = (token, time.monotonic() + DRAFT_TTL_SECONDS, deliver)
+    _outgoing.presented(update.effective_chat.id, token)
     return "Draft shown in Telegram. Awaiting the user's Send button."
 
 
@@ -122,27 +149,17 @@ async def handle_draft_approval(update: Update, context):
         await query.answer("Approval requires an authorized private chat.")
         return
     _, action, token = query.data.split(":")
-    draft = context.chat_data.get("draft")
-    if not draft or draft[0] != token or draft[1] <= time.monotonic():
-        await query.answer("This draft is no longer pending.")
-        return
-    # Consume before the first await so two clicks cannot send twice.
-    del context.chat_data["draft"]
+    from modules import _outgoing
     await query.answer()
-    if action == "cancel":
-        result = "Draft cancelled."
-    else:
-        try:
-            result = await draft[2]()
-        except Exception:
-            logger.exception("Approved delivery could not be confirmed")
-            result = "Delivery status is unknown. Check your Google account before trying again."
+    result = await _outgoing.resolve(update.effective_chat.id, token, action)
     await query.message.reply_text(result)
 
 
 async def _process_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE, user_content: str | list, force_opus: bool = False):
     """Shared handler: send message to agent, reply with text + optional audio."""
     chat_id = update.effective_chat.id
+
+    protagonism.note_user_activity()
 
     # Keep typing indicator alive during long processing (bounded — 10 min max)
     async def _keep_typing():
@@ -159,7 +176,7 @@ async def _process_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
     typing_task = asyncio.create_task(_keep_typing())
     try:
         response, audio_files = await agent.handle_message(
-            chat_id, user_content, force_opus=force_opus, show_draft=partial(_show_draft, update, context)
+            chat_id, user_content, force_opus=force_opus, show_draft=partial(_show_draft, update)
         )
         # Send text first (primary), then audio (supplementary)
         await _send_long(update, response)
@@ -186,9 +203,16 @@ async def _process_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update):
         return
+    protagonism.note_user_activity()
     await update.effective_chat.send_action("typing")
 
     text = update.message.text
+    reply = update.message.reply_to_message
+    saved = feedback.apply_reply_feedback(update.effective_chat.id, text, reply)
+    if saved:
+        await _send_long(update, saved)
+        return
+    text += feedback.get_reply_context(update.effective_chat.id, reply)
     force_opus = False
     if text.startswith("!!"):
         text = text[2:].strip()
@@ -267,7 +291,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photos/screenshots — send to Claude with vision."""
     if not _is_allowed(update):
         return
-    if llm.LOCAL:
+    if llm.uses_local() and not llm.LOCAL_VISION:
         await update.message.reply_text("My local model handles text. Send the text from that image.")
         return
 
@@ -319,7 +343,19 @@ async def _handle_image_document(tmp_name, mime, caption, update, context):
 
 
 async def _handle_pdf_document(tmp_name, file_name, caption, update, context):
-    """Handle a PDF file — send directly to Claude via native document support."""
+    """Extract PDF text locally when the selected model has no document input."""
+    if llm.uses_local():
+        from modules._documents import read_pdf_text
+        from constants import PDF_EXTRACT_TIMEOUT_SECONDS
+        try:
+            extracted = await asyncio.wait_for(asyncio.to_thread(read_pdf_text, tmp_name),
+                                               timeout=PDF_EXTRACT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            await _send_long(update, "PDF text extraction timed out. Try a smaller document or select the pages you need.")
+            return
+        content = f"[PDF: {file_name}; extracted text, not layout or images]\n{extracted}\n\n{caption or 'Please read and analyze this document.'}"
+        await _process_and_respond(update, context, content)
+        return
     import base64
     with open(tmp_name, "rb") as f:
         pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
@@ -383,7 +419,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if audio_file and not audio.can_transcribe():
         await update.message.reply_text(audio.VOICE_SETUP)
         return
-    if llm.LOCAL and (mime.startswith("image/") or mime == "application/pdf" or file_name.lower().endswith(".pdf")):
+    if llm.uses_local() and not llm.LOCAL_VISION and mime.startswith("image/"):
         await update.message.reply_text("My local model handles text. Send the text from that file or image.")
         return
     tg_file = await doc.get_file()
@@ -398,7 +434,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if mime.startswith("image/"):
             await _handle_image_document(tmp.name, mime, caption, update, context)
-        elif mime == "application/pdf":
+        elif mime == "application/pdf" or file_name.lower().endswith(".pdf"):
             await _handle_pdf_document(tmp.name, file_name, caption, update, context)
         elif audio_file:
             await _handle_audio_document(tmp.name, file_name, caption, update, context)
@@ -439,18 +475,30 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        due = await tools.check_due_reminders()
-        for reminder_id, chat_id, text in due:
-            if chat_id in ALLOWED_USER_IDS and chat_id > 0:
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=f"\U0001f514 Reminder: {text}")
-                except Exception:
-                    logger.warning("Reminder %s could not be delivered; will retry", reminder_id)
-                    continue
+    for reminder_id, chat_id, text, ref in await tools.get_due_reminders():
+        if chat_id not in ALLOWED_USER_IDS:
             await tools.finish_reminder(reminder_id)
-    except Exception:
-        logger.exception("Reminder check failed")
+            continue
+        ref = ref or f"reminder:{reminder_id}"
+        decision = feedback.get_suppression(ref, text)
+        if decision == "snoozed":
+            continue
+        if decision != "dismissed":
+            try:
+                if text.startswith(protagonism.FOLLOWUP_PREFIX):
+                    if chat_id != heartbeat.OWNER_CHAT_ID:
+                        await tools.finish_reminder(reminder_id)
+                        continue
+                    if not await protagonism.compose_followup(context, text, ref):
+                        continue
+                else:
+                    sent = await context.bot.send_message(chat_id=chat_id, text=f"🔔 Reminder: {text}")
+                    if sent is not None:
+                        feedback.record_notice(chat_id, sent.message_id, ref, text)
+            except Exception:
+                logger.warning("Reminder %s could not be delivered; will retry", reminder_id)
+                continue
+        await tools.finish_reminder(reminder_id)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -460,6 +508,7 @@ def _register_handlers(app):
     """Add all Telegram command and message handlers to the application."""
     app.add_handler(CallbackQueryHandler(handle_draft_approval, pattern=r"^draft:(send|cancel):[0-9a-f]{24}$"))
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("evolve", evolve_command))
     app.add_handler(CommandHandler("opus", opus_command))
     app.add_handler(CommandHandler("sonnet", sonnet_command))
     app.add_handler(CommandHandler("model", model_command))
@@ -473,12 +522,19 @@ def _register_handlers(app):
 def _schedule_jobs(app, tz):
     """Set up all job_queue entries — reminders, heartbeat, and whatsapp summarizer."""
     from datetime import time as dt_time
+    import connection_health
+    connection_health.schedule(app, tz, heartbeat.OWNER_CHAT_ID)
 
     # Reminder checks every 60 seconds
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
 
     # Heartbeat jobs
     if heartbeat.OWNER_CHAT_ID:
+        for hour in (9, 13, 17):
+            app.job_queue.run_daily(heartbeat.email_triage, time=dt_time(hour, 0, tzinfo=tz))
+        for hour in (10, 15):
+            app.job_queue.run_daily(protagonism.anchor_scout, time=dt_time(hour, 0, tzinfo=tz))
+        app.job_queue.run_daily(protagonism.leisure_menu, time=dt_time(16, 0, tzinfo=tz), days=(5,))
         app.job_queue.run_daily(heartbeat.morning_briefing, time=dt_time(7, 30, tzinfo=tz))
         app.job_queue.run_daily(heartbeat.evening_wrapup, time=dt_time(21, 0, tzinfo=tz))
         app.job_queue.run_repeating(heartbeat.check_upcoming_meetings, interval=300, first=30)
@@ -500,6 +556,7 @@ def main():
 
     try:
         ALLOWED_USER_IDS, heartbeat.OWNER_CHAT_ID = validate_access()
+        protagonism.OWNER_CHAT_ID = heartbeat.OWNER_CHAT_ID
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -536,7 +593,12 @@ def main():
     logger.info("Restricted to %d authorized private chat(s)", len(ALLOWED_USER_IDS))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app.bot_data.get("restart_after_update")
 
 
 if __name__ == "__main__":
-    main()
+    from supervise import instance_lock
+    with instance_lock("bot"):
+        restart = main()
+    if restart and os.getenv("MYGG_SUPERVISED") != "1":
+        os.execv(sys.executable, [sys.executable, *sys.argv])

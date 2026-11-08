@@ -1,0 +1,5 @@
+{"id":"todos","split":"train","request":"List my pending tasks.","expected_tool":"list_todos","expected_args":{"status":"pending"}}
+{"id":"calendar","split":"val","request":"What meetings are on my calendar this week?","expected_tool":"get_calendar","expected_args":{}}
+{"id":"reminder","split":"test","request":"Remind me tomorrow at noon to water the plants.","expected_tool":"set_reminder","expected_args":{}}
+{"id":"weather","split":"test","request":"Check the current weather in Oslo.","expected_tool":"get_weather","expected_args":{"location":"Oslo"}}
+{"id":"goals","split":"val","request":"Read my current personal goals.","expected_tool":"get_personal_goals","expected_args":{}}

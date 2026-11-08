@@ -1,0 +1,3 @@
+# Optional local multilingual speech synthesis. See ONBOARDING.md.
+chatterbox-tts==0.1.7
+soundfile>=0.13

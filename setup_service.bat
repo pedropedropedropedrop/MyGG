@@ -60,6 +60,7 @@ nssm set %SERVICE_NAME% AppStderr "%MYGG_LOGS%\mygg-error.log" || exit /b 1
 nssm set %SERVICE_NAME% AppRotateFiles 1 || exit /b 1
 nssm set %SERVICE_NAME% AppRotateBytes 10485760 || exit /b 1
 nssm set %SERVICE_NAME% AppExit Default Restart || exit /b 1
+nssm set %SERVICE_NAME% AppEnvironmentExtra MYGG_SUPERVISED=1 || exit /b 1
 nssm set %SERVICE_NAME% AppRestartDelay 5000 || exit /b 1
 
 echo Service installed. To manage MyGG, run:

@@ -13,12 +13,20 @@ TOOL_RESULT_MAX_CHARS = 6000      # Truncation limit for tool results sent back 
 
 EMAIL_DRAFT_MAX_CHARS = 4096      # Maximum email body to preview for approval
 DRAFT_TTL_SECONDS = 600           # Telegram approval buttons expire after ten minutes
+EMAIL_THREAD_MAX_MESSAGES = 10
+EMAIL_MIME_PART_LIMIT = 100
+GOOGLE_API_TIMEOUT_SECONDS = 30
 EMAIL_BODY_MAX_CHARS = 3000       # Truncation limit for email body in read_email
 
 # ── Web (removed — now using Anthropic server-side tools) ──────────────────
 
 # ── Files ───────────────────────────────────────────────────────────────────
 
+PDF_MAX_FILE_BYTES = 10_000_000
+PDF_MAX_PAGES = 20
+PDF_MAX_TEXT_CHARS = 16000
+PDF_MAX_PAGE_CONTENT_BYTES = 2_000_000
+PDF_EXTRACT_TIMEOUT_SECONDS = 30
 FILE_READ_MAX_CHARS = 8000        # Max chars to read from uploaded text documents
 
 # ── Audio / Meetings ────────────────────────────────────────────────────────
@@ -66,3 +74,24 @@ WHOOP_OAUTH_SCOPES = (
     "read:recovery read:sleep read:workout read:cycles "
     "read:profile read:body_measurement offline"
 )
+
+GOOGLE_PAGE_SIZE = 100
+TASK_NOTES_MAX_CHARS = 500
+TASK_WRITE_TIMEOUT_SECONDS = 30
+GOAL_MAX_ITEMS = 5
+GOAL_FIELD_MAX_CHARS = 400
+GOAL_RECORD_MAX_CHARS = 5000
+GOAL_HISTORY_LIMIT = 100
+GOAL_HISTORY_READ_LIMIT = 10
+FEEDBACK_MAX_ITEMS = 5000
+FEEDBACK_CONTEXT_ITEMS = 30
+FEEDBACK_TEXT_MAX_CHARS = 1000
+FEEDBACK_REF_MAX_CHARS = 256
+FEEDBACK_NOTICE_LIMIT = 2000
+FEEDBACK_ALIAS_LIMIT = 30000
+SUBAGENT_MAX_ITERATIONS = 6   # Hard cap on tool-use iterations per sub-agent invocation
+SUBAGENT_CHAT_ID = -1         # Sentinel chat_id for sub-agents — chat-bound tools must reject this
+PRE_MEETING_ALERT_WINDOW_MIN = 15  # Fire pre-meeting alert when event starts within this many minutes
+MEETING_LOOKAHEAD_MIN = 20         # How far ahead to query the calendar each scheduler tick
+
+GOOGLE_PAGE_LIMIT = 10

@@ -8,13 +8,14 @@ import threading
 import logging
 import re
 from importlib.util import find_spec
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from utils import write_secret_file
 
 from constants import (
-    EMAIL_BODY_MAX_CHARS,
+    GOOGLE_PAGE_SIZE, GOOGLE_PAGE_LIMIT, TASK_NOTES_MAX_CHARS,
+    EMAIL_BODY_MAX_CHARS, EMAIL_THREAD_MAX_MESSAGES, EMAIL_MIME_PART_LIMIT, GOOGLE_API_TIMEOUT_SECONDS,
     EMAIL_DRAFT_MAX_CHARS,
     MEMORY_RECALL_TIMEOUT_SECONDS,
     TRANSCRIBE_TIMEOUT_SECONDS,
@@ -31,10 +32,15 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
 ]
 
+TODO_BACKEND = os.getenv("TODO_BACKEND", "sqlite").lower().strip()
+if TODO_BACKEND not in {"sqlite", "google"}:
+    raise ValueError("TODO_BACKEND must be sqlite or google")
+
 GOOGLE_ACCOUNTS = {
     "personal": {
         "token_path": Path(__file__).parent / "token.json",
         "label": os.getenv("GOOGLE_ACCOUNT_LABEL", "Personal Google account"),
+        "email": os.getenv("GOOGLE_ACCOUNT_EMAIL", "").strip(),
     },
 }
 for account_name in os.getenv("GOOGLE_EXTRA_ACCOUNTS", "").split(","):
@@ -44,6 +50,7 @@ for account_name in os.getenv("GOOGLE_EXTRA_ACCOUNTS", "").split(","):
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", account_name):
         raise ValueError("GOOGLE_EXTRA_ACCOUNTS needs lowercase names such as work,club.")
     GOOGLE_ACCOUNTS[account_name] = {
+        "email": os.getenv(f"GOOGLE_ACCOUNT_{account_name.upper()}_EMAIL", "").strip(),
         "token_path": Path(__file__).with_name(f"token_{account_name}.json"),
         "label": os.getenv(f"GOOGLE_ACCOUNT_{account_name.upper()}_LABEL", account_name),
     }
@@ -70,6 +77,9 @@ def init_db():
                 project TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                chat_id INTEGER PRIMARY KEY, messages TEXT NOT NULL, updated_order INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS reminders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,9 +124,22 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now'))
             );
         """)
+        conn.execute("BEGIN IMMEDIATE")
+        for table, columns in (("todos", {"notes": "TEXT", "source_id": "TEXT"}),
+                               ("reminders", {"item_ref": "TEXT NOT NULL DEFAULT ''"})):
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_source ON todos(source_id) WHERE source_id IS NOT NULL")
         conn.commit()
     finally:
         conn.close()
+    from modules import feedback, goals, protagonism
+    feedback.init_feedback()
+    goals.init_goals()
+    protagonism._init_table()
+
 
 
 # ── Memory (mem0) ────────────────────────────────────────────────────────────
@@ -166,7 +189,17 @@ def _get_memory():
             },
             "version": "v1.1",
         }
-        _memory_client = Memory.from_config(config)
+        memory = Memory.from_config(config)
+        # mem0's Ollama adapters construct clients without a request deadline.
+        import httpx
+        for provider, seconds in ((memory.embedding_model, 10), (memory.llm, 300)):
+            transport = getattr(provider.client, "_client", None)
+            if not isinstance(transport, httpx.Client):
+                raise RuntimeError("Cannot apply a safe timeout to this mem0 Ollama client.")
+            transport.timeout = httpx.Timeout(seconds, connect=5, pool=5)
+        chat = memory.llm.client.chat
+        memory.llm.client.chat = lambda **kwargs: chat(**{"think": False, **kwargs})
+        _memory_client = memory
     return _memory_client
 
 
@@ -175,26 +208,29 @@ def _memory_user_id() -> str:
     return os.getenv("USER_NAME", "user").strip().lower() or "user"
 
 
-async def remember(text: str, tags: list[str] | None = None, *, infer: bool = True) -> str:
+async def remember(text: str, tags: list[str] | None = None, *, infer: bool = True, source: dict | None = None) -> str:
     if not memory_enabled():
         return "Long-term memory is turned off. See the memory setup in ONBOARDING.md."
-    metadata = {}
+    metadata = dict(source or {})
     if tags:
         metadata["tags"] = ",".join(tags)
     metadata["stored_at"] = datetime.now(TZ).isoformat()
 
     def _add():
         m = _get_memory()
-        return m.add(text, user_id=_memory_user_id(), metadata=metadata, infer=infer)
+        def store(infer, meta):
+            result = m.add(text, user_id=_memory_user_id(), metadata=meta, infer=infer)
+            rows = result.get("results", []) if isinstance(result, dict) else result
+            return any(isinstance(row, dict) and row.get("id") and row.get("event") in {"ADD", "UPDATE"}
+                       for row in (rows or []))
+        if store(infer, metadata):
+            return
+        if infer and store(False, {**metadata, "verbatim_fallback": True}):
+            return
+        raise RuntimeError("The memory store did not confirm saving the observation.")
 
-    result = await asyncio.to_thread(_add)
-    rows = result.get("results", []) if isinstance(result, dict) else result
-    if any(isinstance(row, dict) and row.get("id") and row.get("event") in {"ADD", "UPDATE"}
-           for row in (rows or [])):
-        return f"Stored: {text}"
-    if infer:
-        return "No new long-term memory was recorded."
-    raise RuntimeError("The memory store did not confirm saving the summary.")
+    await asyncio.to_thread(_add)
+    return f"Stored: {text}"
 
 
 async def recall(query: str) -> str:
@@ -208,58 +244,71 @@ async def recall(query: str) -> str:
     hits = results.get("results", []) if isinstance(results, dict) else results
     if not hits:
         return "No relevant memories found."
-    return "\n".join(f"- {r['memory']}" for r in hits)
+
+    def _dated(r: dict) -> str:
+        meta = r.get("metadata") or {}
+        when = (meta.get("stored_at") or r.get("created_at") or "")[:10]
+        source = [f"recorded {when or 'unknown'}"]
+        if meta.get("channel") and meta.get("conversation_id"):
+            source.extend([str(meta["channel"]), f"chat {meta['conversation_id']}"])
+        else:
+            source.append("source unknown")
+        if meta.get("source_start"):
+            source.append(f"observed {meta['source_start']} to {meta.get('source_end', meta['source_start'])}")
+        if meta.get("tags"):
+            source.append(f"tags {meta['tags']}")
+        refs = meta.get("source_refs") or []
+        if isinstance(refs, list):
+            source.extend(str(ref) for ref in refs[:5])
+            if len(refs) > 5:
+                source.append(f"{len(refs) - 5} more source messages")
+        return f"- [{'; '.join(source)}] {r['memory']}"
+
+    return "Historical observations; verify current status and recipient before acting.\n" + "\n".join(_dated(r) for r in hits)
 
 
 # ── Google Services (multi-account) ─────────────────────────────────────────
 
-_services: dict[str, dict] = {}  # {account_name: {"calendar": ..., "gmail": ...}}
+_google_refresh_lock = threading.Lock()
 
 
 def _get_google_creds(account: str):
-    """Get credentials for a Google account, refreshing if expired."""
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
     acct = GOOGLE_ACCOUNTS.get(account)
     if not acct or not acct["token_path"].exists():
         return None
+    with _google_refresh_lock:
+        creds = Credentials.from_authorized_user_file(str(acct["token_path"]))
+        if creds.expired and creds.refresh_token:
+            transport = Request()
+            def request(*args, **kwargs):
+                kwargs.setdefault("timeout", 15)
+                return transport(*args, **kwargs)
+            creds.refresh(request)
+            write_secret_file(acct["token_path"], creds.to_json())
+        return creds
 
-    creds = Credentials.from_authorized_user_file(str(acct["token_path"]), GOOGLE_SCOPES)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        write_secret_file(acct["token_path"], creds.to_json())
-        # Invalidate cached services — they hold the old credentials
-        _services.pop(account, None)
-    return creds
+
+def _google_service(account, api, version):
+    # googleapiclient uses httplib2, whose connections cannot be shared by research threads.
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
+    from googleapiclient.discovery import build
+    creds = _get_google_creds(account)
+    if not creds:
+        return None
+    transport = AuthorizedHttp(creds, http=httplib2.Http(timeout=GOOGLE_API_TIMEOUT_SECONDS))
+    return build(api, version, http=transport, cache_discovery=False)
 
 
 def _get_calendar_service(account: str = "personal"):
-    if account in _services and "calendar" in _services[account]:
-        return _services[account]["calendar"]
-
-    from googleapiclient.discovery import build
-    creds = _get_google_creds(account)
-    if not creds:
-        return None
-
-    service = build("calendar", "v3", credentials=creds)
-    _services.setdefault(account, {})["calendar"] = service
-    return service
+    return _google_service(account, "calendar", "v3")
 
 
 def _get_gmail_service(account: str = "personal"):
-    if account in _services and "gmail" in _services[account]:
-        return _services[account]["gmail"]
-
-    from googleapiclient.discovery import build
-    creds = _get_google_creds(account)
-    if not creds:
-        return None
-
-    service = build("gmail", "v1", credentials=creds)
-    _services.setdefault(account, {})["gmail"] = service
-    return service
+    return _google_service(account, "gmail", "v1")
 
 
 def _available_accounts() -> list[str]:
@@ -270,23 +319,60 @@ def _available_accounts() -> list[str]:
 # ── Google Calendar ──────────────────────────────────────────────────────────
 
 
+def _google_unavailable(account: str) -> str:
+    assert isinstance(account, str), "account must be text"
+    return f"Google account '{account}' unavailable; results are incomplete. Reauthorize with: python setup_calendar.py {account}"
+
+
+def _list_google_pages(fetch, params: dict, item_key: str = "items", limit: int = 0) -> list[dict]:
+    """Bounded pagination; fail explicitly instead of silently hiding later items."""
+    assert callable(fetch) and isinstance(params, dict)
+    params = dict(params)
+    items = []
+    for _ in range(GOOGLE_PAGE_LIMIT):
+        result = fetch(**params).execute()
+        items.extend(result.get(item_key, []))
+        if limit and len(items) >= limit:
+            return items[:limit]
+        token = result.get("nextPageToken")
+        if not token:
+            return items
+        params["pageToken"] = token
+    raise RuntimeError(f"Google results exceed {GOOGLE_PAGE_LIMIT} pages; narrow the query.")
+
+
+# ── Google Calendar ──────────────────────────────────────────────────────────
+
+
+def _event_start(event):
+    start = event["start"]
+    dt = datetime.fromisoformat(start.get("dateTime") or start["date"])
+    return dt.astimezone(TZ) if dt.tzinfo else dt.replace(tzinfo=TZ)
+
+
 def _format_calendar_events(events: list, num_accounts: int) -> list[str]:
     """Format calendar events into human-readable lines."""
+    from modules import feedback
     lines = []
     current_date = None
     for event in events:
         raw = event["start"].get("dateTime", event["start"].get("date", ""))
         summary = event.get("summary", "(no title)")
+        ref = f"calendar:{event['_account']}:{event['id']}" if event.get("id") else ""
+        if ref:
+            feedback.register_item(ref, summary)
+            if feedback.should_suppress(ref, summary):
+                continue
         acct_tag = f" [{event['_account']}]" if num_accounts > 1 else ""
-        if "T" in raw:
-            dt = datetime.fromisoformat(raw)
-            day_str = dt.strftime("%a %b %d")
-            if day_str != current_date:
-                current_date = day_str
-                lines.append(f"\n{day_str}:")
-            lines.append(f"  {dt.strftime('%H:%M')} - {summary}{acct_tag}")
-        else:
-            lines.append(f"  All day - {summary}{acct_tag}")
+        if ref:
+            acct_tag += f" [ref: {ref}]"
+        dt = _event_start(event)
+        day_str = dt.strftime("%a %b %d")
+        if day_str != current_date:
+            current_date = day_str
+            lines.append(f"\n{day_str}:")
+        when = dt.strftime("%H:%M") if "T" in raw else "All day"
+        lines.append(f"  {when} - {summary}{acct_tag}")
     return lines
 
 
@@ -307,21 +393,16 @@ async def get_calendar(date: str | None = None, days: int = 1, account: str | No
         for acct in accounts:
             service = _get_calendar_service(acct)
             if not service:
+                all_events.append({"_error": _google_unavailable(acct)})
                 continue
             label = GOOGLE_ACCOUNTS[acct]["label"]
             try:
-                events_result = (
-                    service.events()
-                    .list(
-                        calendarId="primary",
-                        timeMin=start.isoformat(),
-                        timeMax=end.isoformat(),
-                        singleEvents=True,
-                        orderBy="startTime",
-                    )
-                    .execute()
-                )
-                for event in events_result.get("items", []):
+                events = _list_google_pages(service.events().list, {
+                    "calendarId": "primary", "timeMin": start.isoformat(),
+                    "timeMax": end.isoformat(), "singleEvents": True,
+                    "orderBy": "startTime", "maxResults": GOOGLE_PAGE_SIZE,
+                })
+                for event in events:
                     event["_account"] = acct
                     event["_label"] = label
                     all_events.append(event)
@@ -333,13 +414,8 @@ async def get_calendar(date: str | None = None, days: int = 1, account: str | No
                 f" ({days} days)" if days > 1 else ""
             )
 
-        # Sort by start time
-        def sort_key(ev):
-            raw = ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date", ""))
-            return raw
-
         errors = [e for e in all_events if "_error" in e]
-        events = sorted([e for e in all_events if "_error" not in e], key=sort_key)
+        events = sorted((e for e in all_events if "_error" not in e), key=_event_start)
 
         lines = []
         if errors:
@@ -399,18 +475,11 @@ async def get_upcoming_events(minutes: int = 20) -> list[dict]:
             if not service:
                 continue
             try:
-                events_result = (
-                    service.events()
-                    .list(
-                        calendarId="primary",
-                        timeMin=now.isoformat(),
-                        timeMax=end.isoformat(),
-                        singleEvents=True,
-                        orderBy="startTime",
-                    )
-                    .execute()
-                )
-                for event in events_result.get("items", []):
+                events = _list_google_pages(service.events().list, {
+                    "calendarId": "primary", "timeMin": now.isoformat(), "timeMax": end.isoformat(),
+                    "singleEvents": True, "orderBy": "startTime", "maxResults": GOOGLE_PAGE_SIZE,
+                })
+                for event in events:
                     event["_account"] = acct
                     results.append(event)
             except Exception:
@@ -434,25 +503,33 @@ def _parse_email_headers(headers: list) -> dict:
 def _get_email_body(payload: dict) -> str:
     """Extract plain text body from Gmail message payload."""
     import base64
+    from modules._web import _html_to_text
 
-    # Simple message
-    if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
-        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
-
-    # Multipart — look for text/plain
-    for part in payload.get("parts", []):
-        if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-            return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
-        # Nested multipart
-        for sub in part.get("parts", []):
-            if sub.get("mimeType") == "text/plain" and sub.get("body", {}).get("data"):
-                return base64.urlsafe_b64decode(sub["body"]["data"]).decode("utf-8", errors="replace")
-
-    return "(no text body)"
+    assert isinstance(payload, dict), "email payload must be an object"
+    pending, html = [payload], []
+    for _ in range(EMAIL_MIME_PART_LIMIT):
+        if not pending:
+            break
+        part = pending.pop(0)
+        pending.extend(part.get("parts", [])[:EMAIL_MIME_PART_LIMIT - len(pending)])
+        if part.get("filename"):
+            continue
+        encoded = part.get("body", {}).get("data")
+        if not encoded or part.get("mimeType") not in ("text/plain", "text/html"):
+            continue
+        text = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8", errors="replace")
+        if part["mimeType"] == "text/plain":
+            return text
+        html.append(_html_to_text(text))
+    return "\n".join(html) or "(no text body)"
 
 
 async def list_emails(query: str = "is:inbox", max_results: int = 10, account: str | None = None) -> str:
+    assert isinstance(query, str) and query.strip(), "email query is required"
+    if not isinstance(max_results, int) or not 1 <= max_results <= GOOGLE_PAGE_SIZE * GOOGLE_PAGE_LIMIT:
+        raise ValueError("max_results is outside the supported range")
     def _list():
+        from modules import feedback
         accounts = [account] if account else _available_accounts()
         if not accounts:
             return "No email accounts configured. Run: python setup_calendar.py"
@@ -461,17 +538,14 @@ async def list_emails(query: str = "is:inbox", max_results: int = 10, account: s
         for acct in accounts:
             service = _get_gmail_service(acct)
             if not service:
+                all_lines.append(f"⚠ {_google_unavailable(acct)}")
                 continue
             label = GOOGLE_ACCOUNTS[acct]["label"]
 
             try:
-                results = (
-                    service.users()
-                    .messages()
-                    .list(userId="me", q=query, maxResults=max_results)
-                    .execute()
-                )
-                messages = results.get("messages", [])
+                messages = _list_google_pages(service.users().messages().list, {
+                    "userId": "me", "q": query, "maxResults": min(max_results, GOOGLE_PAGE_SIZE),
+                }, "messages", limit=max_results)
                 if not messages:
                     continue
 
@@ -487,14 +561,20 @@ async def list_emails(query: str = "is:inbox", max_results: int = 10, account: s
                         .execute()
                     )
                     headers = _parse_email_headers(msg.get("payload", {}).get("headers", []))
+                    source = f"gmail:{acct}:{msg.get('threadId', msg_ref.get('threadId', msg_ref['id']))}"
+                    feedback.register_item(source, headers.get("subject", "(no subject)"))
+                    if feedback.should_suppress(source, headers.get("subject", "")):
+                        continue
                     snippet = msg.get("snippet", "")[:100]
                     unread = "UNREAD" in msg.get("labelIds", [])
                     marker = "[NEW] " if unread else ""
                     acct_tag = f" [{acct}]" if len(accounts) > 1 else ""
                     all_lines.append(
                         f"  {marker}{acct}:{msg_ref['id']}\n"
+                        f"    Source-ID: {source}\n"
                         f"    From: {headers.get('from', '?')}\n"
                         f"    Subject: {headers.get('subject', '(no subject)')}\n"
+                        f"    Date: {headers.get('date', '?')}\n"
                         f"    {snippet}"
                     )
             except Exception as e:
@@ -513,10 +593,12 @@ def _parse_email_id(email_id: str) -> tuple[str, str]:
         parts = email_id.split(":", 1)
         if parts[0] in GOOGLE_ACCOUNTS:
             return parts[0], parts[1]
+        raise ValueError("Unknown Google account in the message ID.")
     return "personal", email_id
 
 
 async def read_email(email_id: str) -> str:
+    assert isinstance(email_id, str) and email_id.strip(), "email_id is required"
     def _read():
         acct, msg_id = _parse_email_id(email_id)
         service = _get_gmail_service(acct)
@@ -529,22 +611,33 @@ async def read_email(email_id: str) -> str:
             .get(userId="me", id=msg_id, format="full")
             .execute()
         )
-        headers = _parse_email_headers(msg.get("payload", {}).get("headers", []))
-        body = _get_email_body(msg.get("payload", {}))
-
-        # Truncate very long emails
-        if len(body) > EMAIL_BODY_MAX_CHARS:
-            body = body[:EMAIL_BODY_MAX_CHARS] + "\n\n... (truncated)"
-
-        label = GOOGLE_ACCOUNTS.get(acct, {}).get("label", acct)
-        return (
-            f"Account: {label}\n"
-            f"From: {headers.get('from', '?')}\n"
-            f"To: {headers.get('to', '?')}\n"
-            f"Date: {headers.get('date', '?')}\n"
-            f"Subject: {headers.get('subject', '(no subject)')}\n"
-            f"\n{body}"
-        )
+        thread_id = msg.get("threadId")
+        if not thread_id:
+            raise RuntimeError("Gmail did not return a thread ID; reply status is unknown.")
+        thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        messages = sorted(thread.get("messages", []), key=lambda m: int(m.get("internalDate", 0)))
+        if not messages:
+            raise RuntimeError("Gmail returned an empty thread; reply status is unknown.")
+        delivered = [m for m in messages if "DRAFT" not in m.get("labelIds", [])]
+        replied = bool(delivered and "SENT" in delivered[-1].get("labelIds", []))
+        state = ("no delivered messages; this thread contains only drafts" if not delivered else
+                 "latest message is from the user; do not create a reply task" if replied else
+                 "latest delivered message is incoming; assess whether a reply is needed")
+        lines = [f"Account: {acct}", f"Source-ID: gmail:{acct}:{thread_id}", f"Reply state: {state}"]
+        if len(messages) > EMAIL_THREAD_MAX_MESSAGES:
+            lines.append(f"Showing latest {EMAIL_THREAD_MAX_MESSAGES} of {len(messages)} thread messages.")
+        # Newest first: the agent's total tool-result budget must retain the current request.
+        for item in reversed(messages[-EMAIL_THREAD_MAX_MESSAGES:]):
+            headers = _parse_email_headers(item.get("payload", {}).get("headers", []))
+            body = _get_email_body(item.get("payload", {}))
+            if len(body) > EMAIL_BODY_MAX_CHARS:
+                body = body[:EMAIL_BODY_MAX_CHARS] + "\n... (truncated)"
+            labels = item.get("labelIds", [])
+            kind = "Unsent draft" if "DRAFT" in labels else "You" if "SENT" in labels else "Incoming"
+            lines.append(f"\nMessage: {acct}:{item['id']} | {kind}\n"
+                         f"From: {headers.get('from', '?')}\nTo: {headers.get('to', '?')}\n"
+                         f"Date: {headers.get('date', '?')}\nSubject: {headers.get('subject', '(no subject)')}\n{body}")
+        return "\n".join(lines)
 
     return await asyncio.to_thread(_read)
 
@@ -640,33 +733,41 @@ async def _deliver_email(draft: dict) -> str:
 # ── Todos ────────────────────────────────────────────────────────────────────
 
 
-async def add_todo(
-    task: str,
-    priority: str = "medium",
-    due_date: str | None = None,
-    project: str | None = None,
-) -> str:
-    def _add():
+async def add_todo(task: str, priority: str = "medium", due_date: str | None = None,
+                   project: str | None = None, notes: str | None = None, source_id: str | None = None) -> str:
+    from modules import feedback
+    if not isinstance(task, str) or not task.strip() or priority not in {"high", "medium", "low"}:
+        raise ValueError("A title and valid priority are required")
+    if due_date:
+        datetime.strptime(due_date, "%Y-%m-%d")
+    if source_id:
+        if len(source_id) > 256 or any(ch in source_id for ch in "\r\n"):
+            raise ValueError("Invalid source reference")
+        if feedback.is_suppressed(source_id, task):
+            return "This item is dismissed or snoozed."
+    if TODO_BACKEND == "google":
+        from modules import _google_tasks
+        return await _google_tasks.add_todo(task, priority, due_date, project, notes, source_id)
+    def add():
         conn = get_db()
         try:
-            cur = conn.execute(
-                "INSERT INTO todos (task, priority, due_date, project) VALUES (?, ?, ?, ?)",
-                (task, priority, due_date, project),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id,status FROM todos WHERE source_id=?", (source_id,)).fetchone() if source_id else None
+            if row:
+                if row["status"] == "done":
+                    return f"Todo already completed: #{row['id']}"
+                conn.execute("UPDATE todos SET task=?,priority=?,due_date=COALESCE(?,due_date),notes=COALESCE(?,notes) WHERE id=?",
+                             (task, priority, due_date, notes, row["id"]))
+                ident, verb = row["id"], "updated"
+            else:
+                ident = conn.execute("INSERT INTO todos(task,priority,due_date,project,notes,source_id) VALUES(?,?,?,?,?,?)",
+                                     (task,priority,due_date,project,notes,source_id or None)).lastrowid
+                verb = "added"
             conn.commit()
-            tid = cur.lastrowid
+            return f"Todo {verb}: #{ident} {task}"
         finally:
             conn.close()
-        parts = [f"Todo #{tid}: {task}"]
-        if priority != "medium":
-            parts.append(f"[{priority}]")
-        if due_date:
-            parts.append(f"(due: {due_date})")
-        if project:
-            parts.append(f"@{project}")
-        return " ".join(parts)
-
-    return await asyncio.to_thread(_add)
+    return await asyncio.to_thread(add)
 
 
 async def list_todos(
@@ -674,6 +775,10 @@ async def list_todos(
     status: str = "pending",
     priority: str | None = None,
 ) -> str:
+    if TODO_BACKEND == "google":
+        from modules import _google_tasks
+        return await _google_tasks.list_todos(project, status, priority)
+    from modules import feedback
     def _list():
         conn = get_db()
         try:
@@ -698,19 +803,27 @@ async def list_todos(
 
         lines = []
         for r in rows:
+            ref = feedback.register_item(f"task:local:{r['id']}", r["task"], r["source_id"] or "")
+            if feedback.should_suppress(ref, r["task"]):
+                continue
             icon = "done" if r["status"] == "done" else "o"
             line = f"  [{icon}] #{r['id']} [{r['priority']}] {r['task']}"
             if r["project"]:
                 line += f" @{r['project']}"
             if r["due_date"]:
                 line += f" (due: {r['due_date']})"
-            lines.append(line)
-        return "\n".join(lines)
+            if r["notes"]:
+                line += f" — {r['notes'][:TASK_NOTES_MAX_CHARS]}"
+            lines.append(f"{line} [ref: {ref}]")
+        return "\n".join(lines) or "No todos found."
 
     return await asyncio.to_thread(_list)
 
 
 async def complete_todo(todo_id: int) -> str:
+    if TODO_BACKEND == "google":
+        from modules import _google_tasks
+        return await _google_tasks.complete_todo(str(todo_id))
     def _do():
         conn = get_db()
         try:
@@ -728,6 +841,9 @@ async def complete_todo(todo_id: int) -> str:
 
 
 async def delete_todo(todo_id: int) -> str:
+    if TODO_BACKEND == "google":
+        from modules import _google_tasks
+        return await _google_tasks.delete_todo(str(todo_id))
     def _do():
         conn = get_db()
         try:
@@ -749,13 +865,25 @@ async def delete_todo(todo_id: int) -> str:
 # ── WhatsApp ────────────────────────────────────────────────────────────────
 
 
+def _whatsapp_source_ref(message) -> str:
+    """Prefer the provider ID; legacy rows keep their non-reused SQLite identity."""
+    from urllib.parse import quote
+    from modules import feedback
+    assert message["id"] is not None
+    provider_id = message["whatsapp_message_id"]
+    suffix = quote(str(provider_id), safe="") if provider_id else f"local:{message['id']}"
+    ref = f"whatsapp:{suffix}"
+    feedback.register_item(ref, message["message_text"] or "")
+    return ref
+
+
 async def search_whatsapp(query: str, chat_name: str | None = None, hours_back: int = 24) -> str:
     """Search raw WhatsApp messages by text content."""
     def _search():
         conn = get_db()
         try:
-            now = datetime.now(TZ)
-            cutoff = (now - timedelta(hours=hours_back)).isoformat()
+            now = datetime.now(timezone.utc)
+            cutoff = (now - timedelta(hours=hours_back)).isoformat().replace("+00:00", "Z")
 
             sql = "SELECT * FROM whatsapp_messages WHERE timestamp >= ? AND message_text IS NOT NULL"
             params: list = [cutoff]
@@ -764,8 +892,8 @@ async def search_whatsapp(query: str, chat_name: str | None = None, hours_back: 
                 sql += " AND message_text LIKE ?"
                 params.append(f"%{query}%")
             if chat_name:
-                sql += " AND chat_name LIKE ?"
-                params.append(f"%{chat_name}%")
+                sql += " AND (chat_jid = ? OR chat_name LIKE ?)"
+                params.extend([chat_name, f"%{chat_name}%"])
 
             sql += " ORDER BY timestamp DESC LIMIT 50"
             rows = conn.execute(sql, params).fetchall()
@@ -775,14 +903,18 @@ async def search_whatsapp(query: str, chat_name: str | None = None, hours_back: 
         if not rows:
             return f"No WhatsApp messages matching '{query}' in the last {hours_back}h."
 
+        from modules import feedback
         lines = []
         for r in rows:
+            ref = _whatsapp_source_ref(r)
+            if feedback.should_suppress(ref, r["message_text"]):
+                continue
             sender = r["sender_name"] or r["sender_jid"]
             chat = r["chat_name"] or r["chat_jid"]
             ts = r["timestamp"][:16].replace("T", " ")
             direction = "You" if r["is_from_me"] else sender
-            lines.append(f"[{ts}] {chat} — {direction}: {r['message_text']}")
-        return "\n".join(lines)
+            lines.append(f"[{ts}] {chat} [chat: {r['chat_jid']}] — {direction}: {r['message_text']} [ref: {ref}]")
+        return "\n".join(lines) or "No WhatsApp messages to surface."
 
     return await asyncio.to_thread(_search)
 
@@ -792,17 +924,17 @@ async def get_whatsapp_summary(chat_name: str | None = None, hours_back: int = 2
     def _get():
         conn = get_db()
         try:
-            now = datetime.now(TZ)
-            cutoff = (now - timedelta(hours=hours_back)).isoformat()
+            now = datetime.now(timezone.utc)
+            cutoff = (now - timedelta(hours=hours_back)).isoformat().replace("+00:00", "Z")
 
             if chat_name:
-                sql = """SELECT chat_name, chat_jid, sender_name, sender_jid, message_text, is_from_me, timestamp
+                sql = """SELECT id, whatsapp_message_id, chat_name, chat_jid, sender_name, sender_jid, message_text, is_from_me, timestamp
                          FROM whatsapp_messages
-                         WHERE timestamp >= ? AND chat_name LIKE ? AND message_text IS NOT NULL
+                         WHERE timestamp >= ? AND (chat_jid = ? OR chat_name LIKE ?) AND message_text IS NOT NULL
                          ORDER BY timestamp DESC LIMIT 100"""
-                rows = conn.execute(sql, (cutoff, f"%{chat_name}%")).fetchall()
+                rows = conn.execute(sql, (cutoff, chat_name, f"%{chat_name}%")).fetchall()
             else:
-                sql = """SELECT chat_name, chat_jid, sender_name, sender_jid, message_text, is_from_me, timestamp
+                sql = """SELECT id, whatsapp_message_id, chat_name, chat_jid, sender_name, sender_jid, message_text, is_from_me, timestamp
                          FROM whatsapp_messages
                          WHERE timestamp >= ? AND message_text IS NOT NULL
                          ORDER BY timestamp DESC LIMIT 100"""
@@ -814,43 +946,106 @@ async def get_whatsapp_summary(chat_name: str | None = None, hours_back: int = 2
             return f"No WhatsApp messages in the last {hours_back}h."
 
         # Group by chat
+        from modules import feedback
         chats: dict[str, list] = {}
+        labels: dict[str, str] = {}
         for r in rows:
-            chat = r["chat_name"] or r["chat_jid"] or "Unknown"
+            ref = _whatsapp_source_ref(r)
+            if feedback.should_suppress(ref, r["message_text"]):
+                continue
+            chat = r["chat_jid"]
             if chat not in chats:
                 chats[chat] = []
+                labels[chat] = r["chat_name"] or chat
             sender = "You" if r["is_from_me"] else (r["sender_name"] or r["sender_jid"])
-            chats[chat].append(f"{sender}: {r['message_text']}")
+            chats[chat].append(f"[{r['timestamp']}] {sender}: {r['message_text']} [ref: {ref}]")
 
-        lines = []
+        lines = ["Recent WhatsApp sample (up to 100 messages total; latest five per chat, oldest first):"] if chats else []
         for chat, msgs in chats.items():
-            lines.append(f"\n{chat} ({len(msgs)} messages):")
+            lines.append(f"\n{labels[chat]} [chat: {chat}] ({len(msgs)} messages in sample):")
             # Show last 5 messages per chat in summary
-            for m in msgs[:5]:
+            for m in reversed(msgs[:5]):
                 lines.append(f"  {m}")
             if len(msgs) > 5:
                 lines.append(f"  ... and {len(msgs) - 5} more")
 
-        return "\n".join(lines)
+        return "\n".join(lines) or "No WhatsApp messages to surface."
 
-    result = await asyncio.to_thread(_get)
+    # Historical memory is available through recall, not mixed into a live message read.
+    return await asyncio.to_thread(_get)
 
-    # Also pull older summarized context from mem0
+
+def _resolve_wa_jid(query: str) -> tuple[str | None, str]:
+    """Freeze an exact contact or group ID before the owner reviews the draft."""
+    import re
+    if not isinstance(query, str) or not query.strip():
+        return None, "Specify a chat name or WhatsApp ID."
+    query = query.strip()
+    valid_jid = r"(?:[0-9]+(?:-[0-9]+)?@g\.us|[0-9]+@(?:s\.whatsapp\.net|lid))"
+    if re.fullmatch(valid_jid, query):
+        return query, query
+    conn = get_db()
     try:
-        mem_query = f"whatsapp {chat_name}" if chat_name else "whatsapp recent"
-        memories = await recall(mem_query)
-        if memories and memories != "No relevant memories found.":
-            result += f"\n\nFrom memory:\n{memories}"
-    except Exception:
-        pass  # mem0 failure shouldn't break the tool
+        def matches(name):
+            return conn.execute("""
+                SELECT chat_jid, chat_name, MAX(timestamp) AS latest FROM whatsapp_messages
+                WHERE instr(lower(chat_name), lower(?)) > 0 GROUP BY chat_jid
+                ORDER BY latest DESC LIMIT 6""", (name,)).fetchall()
+        rows = matches(query)
+        if len(rows) == 1 and re.fullmatch(valid_jid, rows[0]["chat_jid"]):
+            return rows[0]["chat_jid"], rows[0]["chat_name"]
+        if not rows:
+            suggestions = {r["chat_name"] for part in query.split() if len(part) >= 3 for r in matches(part)}
+            hint = " Possible matches: " + ", ".join(sorted(suggestions)[:5]) if suggestions else ""
+            return None, "No matching WhatsApp chat. Ask which chat to use." + hint
+        choices = ", ".join(f"{r['chat_name']} ({r['chat_jid']})" for r in rows)
+        return None, f"Ambiguous or unsupported WhatsApp chat. Ask which exact chat to use: {choices}"
+    finally:
+        conn.close()
 
-    return result
+
+def _wa_control():
+    port = int(os.getenv("WHATSAPP_HEALTH_PORT") or 8786)
+    secret = os.getenv("WHATSAPP_BRIDGE_SECRET", "").strip()
+    return f"http://127.0.0.1:{port}", {"Authorization": f"Bearer {secret}"} if secret else {}
+
+
+async def whatsapp_status() -> dict:
+    import httpx
+    url, headers = _wa_control()
+    if not headers:
+        return {"connection": "disabled"}
+    try:
+        async with httpx.AsyncClient(timeout=4, trust_env=False) as client:
+            response = await client.get(f"{url}/health", headers=headers)
+            response.raise_for_status()
+            status = response.json()
+            if status.get("connection") in {"open", "connecting", "close"}:
+                return {"connection": status["connection"], "pending_incoming": int(status["pending_incoming"])}
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return {"connection": "unavailable"}
+
+
+async def _deliver_whatsapp(draft: dict) -> str:
+    import httpx
+    url, headers = _wa_control()
+    if not headers:
+        raise RuntimeError("WhatsApp bridge is unconfigured")
+    async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
+        response = await client.post(f"{url}/send", headers=headers,
+                                     json={"jid": draft["recipient"], "text": draft["text"]})
+        response.raise_for_status()
+        receipt = response.json().get("id")
+        if not isinstance(receipt, str) or not receipt:
+            raise RuntimeError("WhatsApp did not return a message ID")
+    return f"Sent to {draft['label']} on WhatsApp (receipt {receipt})."
 
 
 # ── Reminders ────────────────────────────────────────────────────────────────
 
 
-async def set_reminder(text: str, when: str, chat_id: int) -> str:
+async def set_reminder(text: str, when: str, chat_id: int, item_ref: str = "") -> str:
     def _set():
         # Validate date format before inserting
         dt = datetime.fromisoformat(when)
@@ -859,8 +1054,8 @@ async def set_reminder(text: str, when: str, chat_id: int) -> str:
         conn = get_db()
         try:
             conn.execute(
-                "INSERT INTO reminders (text, due_at, chat_id) VALUES (?, ?, ?)",
-                (text, dt.isoformat(), chat_id),
+                "INSERT INTO reminders (text, due_at, chat_id, item_ref) VALUES (?, ?, ?, ?)",
+                (text, dt.isoformat(), chat_id, item_ref),
             )
             conn.commit()
         finally:
@@ -870,28 +1065,36 @@ async def set_reminder(text: str, when: str, chat_id: int) -> str:
     return await asyncio.to_thread(_set)
 
 
-async def check_due_reminders() -> list[tuple[int, int, str]]:
+async def get_due_reminders() -> list[tuple[int, int, str, str]]:
     """Read pending deliveries, including older reminders stored in local time."""
 
     def _check():
         conn = get_db()
         try:
             rows = conn.execute(
-                "SELECT id, chat_id, text, due_at FROM reminders WHERE notified = 0"
+                "SELECT id, chat_id, text, due_at, item_ref FROM reminders WHERE notified = 0"
             ).fetchall()
             due = []
             now = datetime.now(TZ)
             for row in rows:
-                when = datetime.fromisoformat(row["due_at"])
+                try:
+                    when = datetime.fromisoformat(row["due_at"])
+                except ValueError:
+                    logger.warning("Invalid date for reminder %s", row["id"])
+                    continue
                 if when.tzinfo is None:
                     when = when.replace(tzinfo=TZ)
                 if when.timestamp() <= now.timestamp():
-                    due.append((row["id"], row["chat_id"], row["text"]))
+                    due.append((row["id"], row["chat_id"], row["text"], row["item_ref"]))
             return due
         finally:
             conn.close()
 
     return await asyncio.to_thread(_check)
+
+
+async def check_due_reminders() -> list[tuple[int, int, str]]:
+    return [(ident, chat, text) for ident, chat, text, _ in await get_due_reminders()]
 
 
 async def finish_reminder(reminder_id: int) -> None:
@@ -917,8 +1120,8 @@ async def transcribe_audio(file_path: str, timeout: int = TRANSCRIBE_TIMEOUT_SEC
     )
 
 
-async def generate_audio(text: str) -> dict:
-    """Generate audio from text using Edge TTS. Returns {"audio_file": path}."""
+async def generate_audio(text: str, language: str | None = None) -> dict:
+    """Use the configured speech engine and return its temporary audio file."""
     from audio import synthesizer
-    audio_path = await synthesizer.speak_async(text)
+    audio_path = await synthesizer.speak_async(text, language)
     return {"audio_file": audio_path}

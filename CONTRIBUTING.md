@@ -114,6 +114,8 @@ A "module" is a self-contained capability — Whoop, Weather, etc. To add one:
 
 The regression suite lives in `tests/`. Add a focused case when changing access rules, model routing, or module behavior.
 
+For the synthetic tool-routing evaluation, run `python skillopt/eval_routing.py --selftest` to check the scorer offline. To exercise the configured model, run `python skillopt/eval_routing.py --limit 3`. The live evaluation asks the model for tool choices without dispatching those actions. Cloud runs use your API account.
+
 Run with:
 
 ```bash
