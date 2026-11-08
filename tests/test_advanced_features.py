@@ -34,6 +34,9 @@ def test_evolution_installs_only_validated_module_changes(monkeypatch, tmp_path)
     assert "Installed" in evolve.evolve("update", "test-only")
     assert (root / "modules" / "example.py").read_text() == "VALUE=2"
     monkeypatch.setattr(evolve, "_apply_request", lambda folder, request:
+                        (folder / "audio.py").write_text("VOICE = 'stock'"))
+    assert "audio.py" in evolve.evolve("extend speech", "test-only")
+    monkeypatch.setattr(evolve, "_apply_request", lambda folder, request:
                         (folder / "validate.py").write_text("raise Exception"))
     with pytest.raises(ValueError, match="protected"):
         evolve.evolve("another update", "test-only")

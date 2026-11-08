@@ -10,6 +10,11 @@ import threading
 
 ROOT = Path(__file__).resolve().parent
 _lock = threading.Lock()
+PROTECTED = {
+    "main.py", "agent.py", "evolve.py", "validate.py", "tools.py", "constants.py",
+    "utils.py", "whatsapp_server.py", "whoop_auth.py", "setup_calendar.py", "supervise.py",
+    "llm.py", "_outgoing.py", "_web.py", "_documents.py", "__init__.py",
+}
 
 
 def authorized(word: str) -> bool:
@@ -34,17 +39,19 @@ def _apply_request(folder: Path, request: str) -> None:
     subprocess.run([cli, "--bare", "--print", "--model", "sonnet",
                     "--tools", "Read,Glob,Grep,Edit,Write", "--permission-mode", "acceptEdits",
                     "--allowedTools", "Read,Glob,Grep,Edit,Write", "--max-turns", "15",
-                    "--append-system-prompt", "Edit only domain modules in modules/ and their tests in tests/. "
-                    "Follow modules/_template.py. Do not change Git state or existing security checks.",
+                    "--append-system-prompt", "Implement the requested assistant feature in application Python, modules, "
+                    "tests or Markdown documentation. Follow modules/_template.py when adding tools. "
+                    "Do not change Git state, credentials, release configuration or protected security checks.",
                     "--", request], cwd=folder, env=env, capture_output=True, check=True, timeout=600)
 
 
 def _validate(folder: Path, changes: list[str]) -> None:
     for name in changes:
         path = Path(name)
-        if (len(path.parts) != 2 or path.parts[0] not in {"modules", "tests"}
-                or path.suffix != ".py" or path.name.startswith("_")
-                or (folder / path).is_symlink()):
+        if (path.suffix.lower() not in {".py", ".md"} or path.name in PROTECTED
+                or any(part.startswith(".") or part == "private" for part in path.parts)
+                or path.name == "personality.md" or (folder / path).is_symlink()
+                or not (folder / path).resolve().is_relative_to(folder.resolve())):
             raise ValueError("The proposed change touched a protected path.")
     # Exercise the new module with isolated settings. The real .env and runtime data stay in ROOT.
     env = {k: v for k, v in os.environ.items() if k.upper() in {
@@ -52,6 +59,8 @@ def _validate(folder: Path, changes: list[str]) -> None:
         "TMP", "TEMP", "TMPDIR", "LANG", "WINDIR", "SYSTEMDRIVE", "COMSPEC"}}
     env.update(LLM_BACKEND="local", ENABLE_MEMORY="false", TELEGRAM_BOT_TOKEN="1234:offline",
                ALLOWED_USER_IDS="42", PYTHONUTF8="1")
+    subprocess.run([sys.executable, "-m", "compileall", "-q", "."], cwd=folder, env=env,
+                   capture_output=True, check=True, timeout=120)
     subprocess.run([sys.executable, "validate.py"], cwd=folder, env=env,
                    capture_output=True, check=True, timeout=120)
     subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=folder, env=env,
@@ -83,7 +92,7 @@ def evolve(request: str, word: str) -> str:
                 raise ValueError("The editor proposed no source changes.")
             _validate(folder, changes)
             git(folder, "-c", "user.name=MyGG", "-c", "user.email=mygg@localhost",
-                "commit", "-qm", "Apply requested MyGG module update")
+                "commit", "-qm", "Apply requested MyGG feature update")
             if (git(ROOT, "rev-parse", "HEAD") != start or git(ROOT, "status", "--porcelain")
                     or git(ROOT, "symbolic-ref", "--short", "HEAD") != branch):
                 raise ValueError("Your checkout changed during validation. The update was discarded.")

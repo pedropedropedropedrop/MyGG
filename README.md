@@ -23,7 +23,7 @@ Already running an earlier version? [Update your installation](ONBOARDING.md#upd
 | Update tasks, save goals, review progress and tell GG to snooze or dismiss a recurring suggestion. | [Tasks, goals and follow-ups](ONBOARDING.md#tasks-goals-and-follow-ups). SQLite is built in. Google Tasks is optional. |
 | Ask GG to review your project board or look up information in your own notes. | [Project board and knowledge sources](ONBOARDING.md#project-board-and-knowledge-sources). |
 | Get proactive research, inbox triage, a Friday leisure menu and connection-health notices. | [Briefings and initiative](ONBOARDING.md#briefings). |
-| Ask GG to develop a new module in your own copy, run her unattended or check for upstream updates. | [Owner-requested code changes](ONBOARDING.md#owner-requested-code-changes) · [Supervision and recovery](OPERATIONS.md). |
+| Ask GG to develop a new feature in your own copy, run her unattended or check for upstream updates. | [Owner-requested code changes](ONBOARDING.md#owner-requested-code-changes) · [Supervision and recovery](OPERATIONS.md). |
 
 The computer must be awake and online to answer you or deliver reminders. Claude uses a paid Anthropic API key. Ollama runs model inference on your own hardware. Telegram still carries your messages, and the integrations you connect exchange data with their providers.
 

@@ -205,7 +205,7 @@ To send a text, name a person or group seen in GG's captured WhatsApp history, o
 
 Use a clean **Git clone** of your own fork, connect Claude, install the Claude Code CLI on your PATH and run `python -m pip install pytest` in the MyGG environment. Enter your own ID as `OWNER_CHAT_ID` and configure a private `EVOLVE_SAFEWORD` in `.env`. Restart GG. In a direct message you type yourself, send `/evolve YOUR_SAFEWORD add a module that …`. The command and safeword pass through Telegram. [Claude Code setup](https://code.claude.com/docs/en/setup)
 
-GG lets the CLI prepare Python module or test changes in a disposable checkout. It runs setup validation and the test suite before applying the commit locally and restarting. A failed check leaves the running source intact. If you want successful changes pushed to your fork, point `origin` at that fork, configure your Git credentials and set `EVOLVE_PUSH=true`. Your private settings and existing code edits stay outside this workflow.
+GG lets the CLI edit application Python, domain modules, tests and Markdown documentation in a disposable checkout. Authentication, outbound approval and update controls are protected. It runs setup validation and the test suite before applying the commit locally and restarting. A failed check leaves the running source intact. If you want successful changes pushed to your fork, point `origin` at that fork, configure your Git credentials and set `EVOLVE_PUSH=true`. Your private settings and existing code edits stay outside this workflow.
 
 ### Keep GG running
 
